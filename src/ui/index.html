@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shopfloor</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <h1>Shopfloor</h1>
+  </div>
+  <div class="meters">
+    <span id="meter-attention" class="meter">—</span>
+    <span id="meter-spend" class="meter">—</span>
+    <span id="meter-clock" class="meter muted">—</span>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab is-on" data-view="board" role="tab">Board</button>
+  <button class="tab" data-view="approvals" role="tab">Approvals <span id="badge-approvals" class="badge hidden">0</span></button>
+  <button class="tab" data-view="runs" role="tab">Runs</button>
+  <button class="tab" data-view="workers" role="tab">Workers</button>
+  <button class="tab" data-view="digest" role="tab">Digest</button>
+</nav>
+
+<main>
+  <section id="view-board" class="view"></section>
+  <section id="view-approvals" class="view hidden"></section>
+  <section id="view-runs" class="view hidden"></section>
+  <section id="view-workers" class="view hidden"></section>
+  <section id="view-digest" class="view hidden"></section>
+</main>
+
+<div id="sheet" class="sheet hidden" role="dialog" aria-modal="true">
+  <div class="sheet-card">
+    <button class="sheet-close" aria-label="Close">×</button>
+    <div id="sheet-body"></div>
+  </div>
+</div>
+
+<footer class="foot">
+  <span id="foot-note">local only · nothing leaves this machine</span>
+</footer>
+<script src="/app.js" type="module"></script>
+</body>
+</html>

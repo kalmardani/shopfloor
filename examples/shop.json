@@ -1,0 +1,66 @@
+{
+  "config": {
+    "maxUsdPerDay": 4,
+    "digestAt": "07:30",
+    "notifyCommand": "cat >> ~/shopfloor-digest.md"
+  },
+  "workers": [
+    {
+      "name": "crawler",
+      "role": "collects public tender notices",
+      "adapter": "process",
+      "config": {
+        "command": "node run.mjs --weekly",
+        "cwd": "~/Developer/tender-matcher"
+      }
+    },
+    {
+      "name": "analyst",
+      "role": "reads what the crawler found and writes the short version",
+      "adapter": "claude_local",
+      "maxUsdDay": 2,
+      "config": {
+        "model": "claude-opus-5",
+        "cwd": "~/Developer/tender-matcher",
+        "allowTools": ["Read", "Grep", "Write"],
+        "skipPermissions": false
+      }
+    },
+    {
+      "name": "site",
+      "role": "pings the public site and fails loudly if it is down",
+      "adapter": "http",
+      "config": { "url": "https://example.com/health", "method": "GET" }
+    }
+  ],
+  "jobs": [
+    {
+      "name": "tenders-collect",
+      "worker": "crawler",
+      "schedule": "daily 05:30",
+      "goal": "have this morning's notices on disk before anyone looks",
+      "timeoutSec": 1200
+    },
+    {
+      "name": "tenders-brief",
+      "worker": "analyst",
+      "schedule": "weekdays 07:00",
+      "goal": "three lines on what is worth a bid",
+      "payload": { "prompt": "Read today's notices in ./out and write three lines on what is worth a bid. Write the answer to ./out/brief.md." }
+    },
+    {
+      "name": "tenders-letter",
+      "worker": "analyst",
+      "schedule": "fri 16:00",
+      "requiresApproval": true,
+      "goal": "the weekly letter, which never goes out without a human yes",
+      "payload": { "prompt": "Draft the weekly letter from ./out/brief.md into ./out/letter.md. Do not send anything." }
+    },
+    {
+      "name": "site-up",
+      "worker": "site",
+      "schedule": "every 30m",
+      "goal": "notice an outage before a client does"
+    }
+  ]
+}
