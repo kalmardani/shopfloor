@@ -66,7 +66,7 @@ function render () {
   if (!state) return
   const attention = state.jobs.filter((j) => j.state === 'attention')
   const meter = el('meter-attention')
-  meter.textContent = attention.length ? `${attention.length} need attention` : 'all inside window'
+  meter.textContent = attention.length ? `${attention.length} ${attention.length === 1 ? 'job needs' : 'jobs need'} attention` : 'all inside window'
   meter.className = 'meter ' + (attention.length ? 'bad' : 'good')
   el('meter-spend').textContent = `${money(state.spentToday)} today of ${state.config.maxUsdPerDay} USD`
   el('meter-clock').textContent = `tick ${state.config.tickSeconds}s · ${new Date(state.at).toLocaleTimeString()}`

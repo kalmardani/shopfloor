@@ -9,6 +9,8 @@ npx github:kalmardani/shopfloor init
 npx github:kalmardani/shopfloor serve
 ```
 
+![The board, with one job that went quiet and one waiting for a decision](docs/board.png)
+
 ## Why it exists
 
 Agent CLIs are good at work and bad at running a shop. A prompt in `cron` fires into the dark. A `launchd` plist that never loaded looks exactly like a plist that runs fine. A subscription burns through its quota at 2am and the morning looks normal. The failure nobody sees is the expensive one, and the agent frameworks that wrap the model do not solve it, because the gap is in the floor above them.
