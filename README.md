@@ -17,7 +17,7 @@ Agent CLIs are good at work and bad at running a shop. A prompt in `cron` fires 
 
 Shopfloor is that floor. Your scripts and prompts stay yours, unchanged. Shopfloor only decides when they run, writes down what happened, stops them at a dollar ceiling, asks before anything leaves the building, and raises a hand when a job stops reporting.
 
-It was built after reading [paperclipai/paperclip](https://github.com/paperclipai/paperclip), which solves a larger problem with a larger machine. This one goes the other way, to a single file database and a web interface you can read in one sitting.
+The whole thing fits in a single file database and a web interface you can read in one sitting, because a supervisor you cannot read is one more thing to supervise.
 
 ## Install
 
