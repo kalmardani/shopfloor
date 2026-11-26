@@ -3,9 +3,11 @@ import { loadConfig } from './config.mjs'
 import { startJob, runApproved } from './runner.mjs'
 import { nextRun } from './schedule.mjs'
 import { maybeSendDigest } from './digest.mjs'
+import { dispatchOutbox } from './outbox.mjs'
 
-// The heartbeat of the shop floor. One tick picks up what is due, keeps the
-// number of parallel runs under the ceiling, and lets approved work through.
+// The heartbeat of the shop floor. One tick lets approved work through, picks
+// up what is due, answers what arrived in an inbox, and moves the outgoing
+// queue along. Then it goes back to sleep.
 export async function tick ({ config = loadConfig(), at = Date.now(), log = () => {} } = {}) {
   const started = []
   const skipped = []
@@ -31,19 +33,56 @@ export async function tick ({ config = loadConfig(), at = Date.now(), log = () =
       skipped.push({ job: job.name, why: 'the previous run is still going' })
       continue
     }
+    // The timer writes its firing into the inbox too, so one ledger holds every
+    // reason a run ever started. The slot is the dedupe key, which is what
+    // stops two schedulers from firing the same slot twice.
+    const timer = db.addInboxEvent({ jobId: job.id, source: 'timer', dedupeKey: `timer:${job.next_at}` })
+    if (timer.duplicate) {
+      db.setNextAt(job.id, nextRun(job.schedule, at))
+      skipped.push({ job: job.name, why: 'this slot is already in the inbox' })
+      continue
+    }
     log(`starting: ${job.name}`)
     const outcome = await startJob(job, { trigger: 'schedule', config })
+    db.settleInboxEvent(timer.event.id, 'done', { runId: outcome.run.id, note: `run ended ${outcome.run.status}` })
     started.push({ job: job.name, status: outcome.run.status })
   }
 
+  for (const jobId of db.jobsWithPendingInbox(at)) {
+    if (db.runningCount() >= config.maxConcurrentRuns) {
+      skipped.push({ job: jobId, why: 'the floor is full' })
+      continue
+    }
+    const job = db.getJob(jobId)
+    if (!job) continue
+    const open = db.lastRun(job.id)
+    if (open && open.status === 'running') {
+      skipped.push({ job: job.name, why: 'the previous run is still going' })
+      continue
+    }
+    const event = db.claimInboxEvent(job.id, { at })
+    if (!event) {
+      skipped.push({ job: job.name, why: 'the inbox already has a worker' })
+      continue
+    }
+    log(`inbox: ${job.name} (${event.source})`)
+    const outcome = await startJob(job, { trigger: `inbox:${event.source}`, config, event })
+    started.push({ job: job.name, status: outcome.run.status, trigger: 'inbox' })
+  }
+
+  const outbox = await dispatchOutbox({ config })
+  for (const id of outbox.sent) log(`sent: ${id.slice(0, 8)}`)
+
   await maybeSendDigest({ config, at })
-  return { started, skipped, at }
+  return { started, skipped, outbox, at }
 }
 
 // Runs the loop until the process is asked to stop.
 export async function serveScheduler ({ config = loadConfig(), log = console.log } = {}) {
   const lost = db.markStaleRunsLost()
   if (lost) log(`closed ${lost} run(s) left open by an earlier scheduler`)
+  const handedBack = db.releaseClaimedInboxEvents()
+  if (handedBack) log(`handed ${handedBack} inbox event(s) back to the queue`)
   for (const job of db.listJobs({ includeDisabled: false })) {
     if (job.next_at === null) db.setNextAt(job.id, nextRun(job.schedule, Date.now()))
   }
@@ -62,7 +101,9 @@ export async function serveScheduler ({ config = loadConfig(), log = console.log
       if (Date.now() - lastPrune > 6 * 3600 * 1000) {
         lastPrune = Date.now()
         const removed = db.pruneRuns(config.keepRunDays)
+        const settled = db.pruneInbox(config.keepRunDays) + db.pruneOutbox(config.keepRunDays)
         if (removed) log(`[${stamp()}] pruned ${removed} old run(s)`)
+        if (settled) log(`[${stamp()}] pruned ${settled} settled inbox and outbox row(s)`)
       }
     } catch (err) {
       log(`[${stamp()}] tick failed: ${err.message}`)

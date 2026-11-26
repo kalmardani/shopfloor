@@ -71,7 +71,11 @@ tr.clickable:hover td { background: color-mix(in srgb, var(--accent) 6%, transpa
 .tag { font-size: 11.5px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); }
 .tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
 .tag.fail, .tag.timeout, .tag.lost, .tag.rejected { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
-.tag.quota, .tag.blocked, .tag.awaiting_approval { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
+.tag.quota, .tag.blocked, .tag.awaiting_approval, .tag.held { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
+.tag.sent { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.badge { font-size: 11px; padding: 1px 6px; border-radius: 999px; background: var(--accent); color: #fff; margin-left: 4px; }
+#view-queues h2 { margin: 18px 0 2px; font-size: 17px; }
+#view-queues h2:first-child { margin-top: 0; }
 pre { background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; font-family: var(--mono); font-size: 12.5px; max-height: 50vh; }
 .empty { color: var(--ink-soft); padding: 24px 0; }
 .sheet { position: fixed; inset: 0; background: color-mix(in srgb, var(--ink) 35%, transparent); display: grid; place-items: center; padding: 24px; z-index: 20; }

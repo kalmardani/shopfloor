@@ -1,4 +1,5 @@
 import { runCommand, looksLikeQuotaProblem } from './spawn.mjs'
+import { promptWithContext } from '../memory.mjs'
 
 // Claude Code on this machine, in headless mode. It signs in the way the CLI
 // already does, with the subscription or with CLAUDE_CODE_OAUTH_TOKEN, so no
@@ -17,7 +18,7 @@ export default {
     const prompt = payload.prompt || cfg.prompt
     if (!prompt) throw new Error(`job ${job?.name} has no prompt`)
 
-    const args = ['-p', prompt, '--output-format', 'json']
+    const args = ['-p', promptWithContext(payload, prompt), '--output-format', 'json']
     const model = payload.model || cfg.model
     if (model) args.push('--model', model)
     const systemPrompt = payload.systemPrompt || cfg.systemPrompt

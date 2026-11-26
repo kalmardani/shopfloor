@@ -85,6 +85,53 @@ test('the interface files are served and nothing above them is', async () => {
   assert.ok([403, 404].includes(escape.status), `path above the interface must not be served, got ${escape.status}`)
 })
 
+test('the webhook door takes an event, dedupes it and refuses a browser', async () => {
+  const fresh = db.getJob(job.id)
+  const url = `${base}/in/${fresh.inbox_token}`
+  const post = (body, query = '') => fetch(url + query, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+
+  const first = await post({ message: 'a new file landed' }, '?key=file-9')
+  assert.equal(first.status, 201)
+  const firstBody = await first.json()
+  assert.equal(firstBody.duplicate, false)
+
+  const again = await post({ message: 'a new file landed' }, '?key=file-9')
+  assert.equal((await again.json()).duplicate, true)
+  assert.equal(db.listInbox({ jobId: fresh.id, status: 'pending' }).length, 1)
+
+  assert.equal((await fetch(url)).status, 405, 'a wandering browser cannot queue work')
+  assert.equal((await fetch(`${base}/in/deadbeefdeadbeef`, { method: 'POST' })).status, 404)
+})
+
+test('the api carries the inbox, the memory and the outbox', async () => {
+  const post = (path, body) => fetch(`${base}${path}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${config.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+
+  const queued = await (await post('/api/inbox', { job: 'echo-job', message: 'by hand', dedupeKey: 'hand-1' })).json()
+  assert.equal(queued.duplicate, false)
+  const dropped = await (await post(`/api/inbox/${queued.event.id}/drop`, { note: 'not needed' })).json()
+  assert.equal(dropped.status, 'dropped')
+
+  const remembered = await (await post(`/api/memory/${job.id}`, { key: 'notes', value: '~/notes.md', kind: 'pointer' })).json()
+  assert.equal(remembered.kind, 'pointer')
+  const memory = await (await get(`/api/memory/${job.id}`)).json()
+  assert.equal(memory.length, 1)
+
+  const entry = await (await post('/api/outbox', { job: 'echo-job', channel: 'note', recipient: 'nobody', body: 'a short note' })).json()
+  assert.equal(entry.entry.status, 'pending')
+  const dispatched = await (await post('/api/outbox/dispatch', {})).json()
+  assert.equal(dispatched.silent, true, 'the shop floor starts quiet')
+
+  const state = await (await get('/api/state')).json()
+  assert.equal(state.outbox.counts.pending, 1)
+  assert.equal(state.outbox.sending, false)
+  assert.equal(state.memory, 1)
+  assert.equal(typeof state.inbox.counts.pending, 'number')
+})
+
 test('health answers 503 while something needs attention', async () => {
   const res = await get('/api/health')
   assert.ok([200, 503].includes(res.status))

@@ -10,6 +10,8 @@ import { serveScheduler, tick } from '../src/scheduler.mjs'
 import { buildDigest, notify } from '../src/digest.mjs'
 import { shopHealth, jobHealth, humanAge } from '../src/health.mjs'
 import { adapterNames, getAdapter } from '../src/adapters/index.mjs'
+import { dispatchOutbox, sendOne, retryOutbox } from '../src/outbox.mjs'
+import { directiveHelp } from '../src/directives.mjs'
 
 const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'))
 const argv = process.argv.slice(2)
@@ -42,6 +44,21 @@ const HELP = `shopfloor ${pkg.version} — a shop floor for the agents you alrea
   shopfloor show <run-id>               full output of one run
   shopfloor approvals | approve <id> [--note ...] | reject <id> [--note ...]
 
+  shopfloor inbox [job] [--status pending|claimed|done|dropped]
+  shopfloor inbox add <job> --message "<text>" [--key <dedupe key>] [--source message|reply]
+  shopfloor inbox url <job>             the webhook another system posts to
+  shopfloor inbox drop <event-id> [--note ...]
+
+  shopfloor memory <job>                what the job knows, with where it came from
+  shopfloor memory set <job> <key> "<value>" [--pointer]
+  shopfloor memory rm <job> <key>
+
+  shopfloor outbox [--status pending|held|sent] [--limit 20]
+  shopfloor outbox show <id>            one entry in full
+  shopfloor outbox send <id> [--force]  carry one entry out now
+  shopfloor outbox retry <id> | outbox hold <id> [--note ...]
+  shopfloor outbox dispatch             one pass of the outgoing queue
+
   shopfloor doctor                      what stopped quietly, what is waiting, what it cost
   shopfloor digest [--notify]           the morning text, optionally through notifyCommand
   shopfloor heartbeat <job>             the dead man's switch URL for an outside process
@@ -49,6 +66,10 @@ const HELP = `shopfloor ${pkg.version} — a shop floor for the agents you alrea
   shopfloor import <file.json>          workers and jobs from one file
 
 Schedules: every 15m · daily 07:30 · weekdays 08:00 · mon 09:00 · monthly 1 09:00 · */15 * * * * · manual
+
+What a run can say back, one line at the start of a line in its own output:
+${directiveHelp.split('\n').map((l) => '  ' + l).join('\n')}
+
 Home: ${HOME}
 `
 
@@ -76,6 +97,9 @@ async function main () {
     case 'approvals': return cmdApprovals()
     case 'approve': return cmdDecide('approved')
     case 'reject': return cmdDecide('rejected')
+    case 'inbox': return cmdInbox()
+    case 'memory': return cmdMemory()
+    case 'outbox': return await cmdOutbox()
     case 'doctor': return cmdDoctor()
     case 'digest': return cmdDigest()
     case 'heartbeat': case 'hb': return cmdHeartbeat()
@@ -260,6 +284,17 @@ async function cmdDecide (state) {
   const id = need(positional[1], 'approval id')
   const approval = db.decideApproval(id, state, { by: 'cli', note: flags.note ? String(flags.note) : null })
   db.addEvent({ level: 'info', kind: `approval:${state}`, jobId: approval.job_id, runId: approval.run_id, message: String(flags.note || state) })
+  if (approval.kind === 'outbox') {
+    const entry = db.getOutboxEntry(approval.outbox_id)
+    if (state === 'rejected') {
+      db.updateOutboxEntry(entry.id, { status: 'held', note: flags.note ? String(flags.note) : 'a human said no' })
+      return console.log(`${entry.id.slice(0, 8)} stays in the building`)
+    }
+    const result = await sendOne(entry.id)
+    return console.log(result.ok
+      ? `${entry.id.slice(0, 8)} went out on ${entry.channel}`
+      : `approved, and it waits in the outbox: ${result.reason}`)
+  }
   if (state === 'rejected') {
     db.updateRun(approval.run_id, { status: 'rejected', endedAt: Date.now(), summary: String(flags.note || 'rejected by a human') })
     return console.log(`rejected ${approval.job_name}`)
@@ -271,11 +306,129 @@ async function cmdDecide (state) {
   if (run.stdout) console.log('\n' + run.stdout.trim().slice(-4000))
 }
 
+function cmdInbox () {
+  const action = positional[1]
+  if (action === 'add') {
+    const job = need(db.getJob(positional[2]), `job ${positional[2]}`)
+    const message = flags.message === undefined ? positional.slice(3).join(' ') : String(flags.message)
+    const { event, duplicate } = db.addInboxEvent({
+      jobId: job.id,
+      source: flags.source ? String(flags.source) : 'message',
+      payload: message ? { message } : {},
+      dedupeKey: flags.key ? String(flags.key) : null,
+    })
+    return console.log(duplicate
+      ? `the same event is already in the inbox (${event.id.slice(0, 8)}), nothing added`
+      : `event ${event.id.slice(0, 8)} is in the inbox of ${job.name}, the next tick picks it up`)
+  }
+  if (action === 'url') {
+    const job = need(db.getJob(positional[2]), `job ${positional[2]}`)
+    const config = loadConfig()
+    const url = `http://${config.host}:${config.port}/in/${job.inbox_token}`
+    console.log(url)
+    console.log('')
+    console.log('Post an event from another system:')
+    console.log(`  curl -fsS -X POST -H 'content-type: application/json' -d '{"message":"a new file landed"}' ${url}`)
+    console.log('')
+    return console.log('Add ?key=<something> and the same event never starts two runs.')
+  }
+  if (action === 'drop') {
+    const event = need(db.getInboxEvent(positional[2]), `event ${positional[2]}`)
+    db.settleInboxEvent(event.id, 'dropped', { note: flags.note ? String(flags.note) : 'dropped by hand' })
+    return console.log(`event ${event.id.slice(0, 8)} dropped`)
+  }
+  const jobRef = action
+  const job = jobRef ? need(db.getJob(jobRef), `job ${jobRef}`) : null
+  const list = db.listInbox({ jobId: job?.id || null, status: flags.status ? String(flags.status) : null, limit: Number(flags.limit || 30) })
+  const counts = db.inboxCounts()
+  console.log(`pending ${counts.pending} · claimed ${counts.claimed} · done ${counts.done} · dropped ${counts.dropped}`)
+  if (!list.length) return console.log('nothing in the inbox')
+  for (const e of list) {
+    const text = typeof e.payload.message === 'string' ? e.payload.message : JSON.stringify(e.payload)
+    console.log(`${e.id.slice(0, 8)}  ${(e.job_name || '—').padEnd(24)} ${e.source.padEnd(8)} ${e.status.padEnd(8)} ${humanAge(Date.now() - e.created_at).padStart(4)} ago  ${String(text).slice(0, 60)}`)
+    if (e.note) console.log(`    ${e.note}`)
+  }
+}
+
+function cmdMemory () {
+  const action = positional[1]
+  if (action === 'set') {
+    const job = need(db.getJob(positional[2]), `job ${positional[2]}`)
+    const key = need(positional[3], 'key')
+    const value = need(positional.slice(4).join(' ') || flags.value, 'value')
+    const row = db.setMemory({ jobId: job.id, key, value: String(value), kind: flags.pointer ? 'pointer' : 'note', source: 'cli' })
+    return console.log(`${job.name} knows ${row.key} ${row.kind === 'pointer' ? '->' : '='} ${row.value}`)
+  }
+  if (action === 'rm') {
+    const job = need(db.getJob(positional[2]), `job ${positional[2]}`)
+    const key = need(positional[3], 'key')
+    return console.log(db.deleteMemory(job.id, key) ? `${job.name} forgot ${key}` : `${job.name} had nothing under ${key}`)
+  }
+  const job = need(db.getJob(positional[1]), `job ${positional[1]}`)
+  const rows = db.listMemory(job.id)
+  if (!rows.length) return console.log(`${job.name} knows nothing yet`)
+  for (const row of rows) {
+    console.log(`${row.key.padEnd(22)} ${row.kind === 'pointer' ? '->' : ' ='} ${String(row.value).slice(0, 80)}`)
+    console.log(`    ${row.kind}, written ${humanAge(Date.now() - row.updated_at)} ago by ${row.source || 'unknown'}${row.run_id ? ' ' + row.run_id.slice(0, 8) : ''}`)
+  }
+}
+
+async function cmdOutbox () {
+  const action = positional[1]
+  if (action === 'dispatch') {
+    const result = await dispatchOutbox()
+    if (result.silent) return console.log(`nothing went out: ${result.reason}`)
+    return console.log(`sent ${result.sent.length}, waiting for a decision ${result.held.length}, paced for later ${result.waiting.length}`)
+  }
+  if (action === 'send') {
+    const entry = need(db.getOutboxEntry(positional[2]), `outbox entry ${positional[2]}`)
+    const result = await sendOne(entry.id, { force: !!flags.force })
+    return console.log(result.ok ? `${entry.id.slice(0, 8)} went out on ${entry.channel}` : `not sent: ${result.reason}`)
+  }
+  if (action === 'retry') {
+    const entry = need(db.getOutboxEntry(positional[2]), `outbox entry ${positional[2]}`)
+    retryOutbox(entry.id)
+    return console.log(`${entry.id.slice(0, 8)} is back in the queue`)
+  }
+  if (action === 'hold') {
+    const entry = need(db.getOutboxEntry(positional[2]), `outbox entry ${positional[2]}`)
+    db.updateOutboxEntry(entry.id, { status: 'held', note: flags.note ? String(flags.note) : 'held by hand' })
+    return console.log(`${entry.id.slice(0, 8)} is held`)
+  }
+  if (action === 'show') {
+    const entry = need(db.getOutboxEntry(positional[2]), `outbox entry ${positional[2]}`)
+    console.log(`job      ${entry.job_name || '—'}`)
+    console.log(`channel  ${entry.channel}`)
+    console.log(`to       ${entry.recipient || '—'}`)
+    console.log(`subject  ${entry.subject || '—'}`)
+    console.log(`status   ${entry.status}${entry.note ? ' · ' + entry.note : ''}`)
+    console.log(`made     ${new Date(entry.created_at).toLocaleString()}`)
+    console.log(`sent     ${entry.sent_at ? new Date(entry.sent_at).toLocaleString() : '—'}`)
+    return console.log(`\n${entry.body}`)
+  }
+  const config = loadConfig()
+  const counts = db.outboxCounts()
+  console.log(`pending ${counts.pending} · held ${counts.held} · sent ${counts.sent}`)
+  console.log(config.outboxSend
+    ? `sending is on, ${config.outboxPerTick} per tick, ${config.outboxMinGapSec}s apart${config.outboxCommand ? '' : ', but there is no outboxCommand to carry anything'}`
+    : 'the shop floor is quiet, nothing goes out (shopfloor config outboxSend true)')
+  const list = db.listOutbox({ status: flags.status ? String(flags.status) : null, limit: Number(flags.limit || 20) })
+  if (!list.length) return console.log('the outbox is empty')
+  console.log('')
+  for (const e of list) {
+    console.log(`${e.id.slice(0, 8)}  ${(e.job_name || '—').padEnd(20)} ${e.channel.padEnd(10)} ${(e.recipient || '—').padEnd(24)} ${e.status.padEnd(8)} ${(e.subject || String(e.body).split('\n')[0] || '').slice(0, 44)}`)
+    if (e.note) console.log(`    ${e.note}`)
+  }
+}
+
 function cmdDoctor () {
   const health = shopHealth()
   const config = loadConfig()
   console.log(`home ${HOME}`)
   console.log(`jobs ${health.jobs.length}, workers ${db.listWorkers().length}, spent today ${health.spentToday.toFixed(2)} USD of ${config.maxUsdPerDay} USD`)
+  const inbox = db.inboxCounts()
+  const outbox = db.outboxCounts()
+  console.log(`inbox ${inbox.pending} pending, ${inbox.claimed} claimed · outbox ${outbox.pending} pending, ${outbox.held} held${config.outboxSend ? '' : ' (sending is off)'}`)
   console.log('')
   if (!health.attention.length) console.log('Every job is inside its window.')
   for (const item of health.attention) {

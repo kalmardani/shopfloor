@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   requires_approval INTEGER NOT NULL DEFAULT 0,
   silence_sec INTEGER,
   heartbeat_token TEXT,
+  inbox_token TEXT,
   next_at INTEGER,
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL
@@ -53,7 +54,49 @@ CREATE TABLE IF NOT EXISTS approvals (
   requested_at INTEGER NOT NULL,
   decided_at INTEGER,
   decided_by TEXT,
-  note TEXT
+  note TEXT,
+  kind TEXT NOT NULL DEFAULT 'run',
+  outbox_id TEXT
+);
+CREATE TABLE IF NOT EXISTS inbox (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  source TEXT NOT NULL,
+  dedupe_key TEXT,
+  payload TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'pending',
+  run_id TEXT,
+  parent_run_id TEXT,
+  note TEXT,
+  wait_until INTEGER,
+  created_at INTEGER NOT NULL,
+  claimed_at INTEGER,
+  settled_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS memory (
+  job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'note',
+  source TEXT,
+  run_id TEXT,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (job_id, key)
+);
+CREATE TABLE IF NOT EXISTS outbox (
+  id TEXT PRIMARY KEY,
+  job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
+  run_id TEXT,
+  channel TEXT NOT NULL,
+  recipient TEXT,
+  subject TEXT,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  dedupe_key TEXT,
+  approval_id TEXT,
+  note TEXT,
+  created_at INTEGER NOT NULL,
+  sent_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,7 +115,19 @@ CREATE TABLE IF NOT EXISTS heartbeats (
 CREATE INDEX IF NOT EXISTS runs_job_idx ON runs(job_id, queued_at DESC);
 CREATE INDEX IF NOT EXISTS runs_status_idx ON runs(status);
 CREATE INDEX IF NOT EXISTS events_at_idx ON events(at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS inbox_dedupe_idx ON inbox(job_id, dedupe_key);
+CREATE INDEX IF NOT EXISTS inbox_status_idx ON inbox(status, created_at);
+CREATE INDEX IF NOT EXISTS outbox_status_idx ON outbox(status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS outbox_dedupe_idx ON outbox(job_id, dedupe_key);
 `
+
+// CREATE TABLE IF NOT EXISTS leaves an older database without the columns that
+// arrived later, so every new column is also added here, once, on open.
+const MIGRATIONS = [
+  ['approvals', 'kind', "TEXT NOT NULL DEFAULT 'run'"],
+  ['approvals', 'outbox_id', 'TEXT'],
+  ['jobs', 'inbox_token', 'TEXT'],
+]
 
 let db = null
 
@@ -84,7 +139,19 @@ export function open () {
   db.exec('PRAGMA foreign_keys = ON')
   db.exec('PRAGMA busy_timeout = 5000')
   db.exec(SCHEMA)
+  migrate(db)
   return db
+}
+
+function migrate (d) {
+  for (const [table, column, definition] of MIGRATIONS) {
+    const columns = d.prepare(`PRAGMA table_info(${table})`).all()
+    if (columns.some((c) => c.name === column)) continue
+    d.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+  }
+  for (const row of d.prepare('SELECT id FROM jobs WHERE inbox_token IS NULL').all()) {
+    d.prepare('UPDATE jobs SET inbox_token = ? WHERE id = ?').run(randomUUID().replaceAll('-', ''), row.id)
+  }
 }
 
 export function close () {
@@ -157,10 +224,11 @@ export function createJob ({ workerId, name, goal = null, schedule, payload = {}
   const id = randomUUID()
   const silence = silenceSec === undefined ? silenceWindowSec(schedule) : silenceSec
   d.prepare(`INSERT INTO jobs (id, worker_id, name, goal, schedule, payload, timeout_sec, requires_approval,
-             silence_sec, heartbeat_token, next_at, enabled, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+             silence_sec, heartbeat_token, inbox_token, next_at, enabled, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(id, worker.id, name, goal, schedule, toJson(payload), timeoutSec, requiresApproval ? 1 : 0,
-      silence, randomUUID().replaceAll('-', ''), enabled ? nextRun(schedule) : null, enabled ? 1 : 0, now())
+      silence, randomUUID().replaceAll('-', ''), randomUUID().replaceAll('-', ''),
+      enabled ? nextRun(schedule) : null, enabled ? 1 : 0, now())
   return getJob(id)
 }
 
@@ -194,6 +262,10 @@ export function getJob (idOrName) {
 
 export function getJobByHeartbeatToken (token) {
   return hydrateJob(open().prepare('SELECT * FROM jobs WHERE heartbeat_token = ?').get(token))
+}
+
+export function getJobByInboxToken (token) {
+  return hydrateJob(open().prepare('SELECT * FROM jobs WHERE inbox_token = ?').get(token))
 }
 
 export function listJobs ({ includeDisabled = true } = {}) {
@@ -295,11 +367,12 @@ export function pruneRuns (days) {
 
 /* ---------- approvals ---------- */
 
-export function createApproval ({ runId, jobId, question }) {
+export function createApproval ({ runId, jobId, question, kind = 'run', outboxId = null }) {
   const d = open()
   const id = randomUUID()
-  d.prepare('INSERT INTO approvals (id, run_id, job_id, state, question, requested_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(id, runId, jobId, 'pending', question, now())
+  d.prepare(`INSERT INTO approvals (id, run_id, job_id, state, question, requested_at, kind, outbox_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, runId, jobId, 'pending', question, now(), kind, outboxId)
   return getApproval(id)
 }
 
@@ -353,4 +426,213 @@ export function recordHeartbeat (jobId, note = null) {
 
 export function getHeartbeat (jobId) {
   return open().prepare('SELECT * FROM heartbeats WHERE job_id = ?').get(jobId) ?? null
+}
+
+/* ---------- inbox ---------- */
+
+function hydrateInbox (row) {
+  if (!row) return null
+  return { ...row, payload: parse(row.payload) }
+}
+
+// Every new piece of work arrives here, whatever brought it: a message typed
+// at the command line, a webhook, the timer, or the answer of an earlier run.
+// A dedupe key is the promise that the same event never starts two runs, which
+// is why the unique index carries it rather than the code checking first.
+export function addInboxEvent ({ jobId, source = 'message', payload = {}, dedupeKey = null,
+  parentRunId = null, note = null, waitUntil = null }) {
+  const d = open()
+  if (dedupeKey) {
+    const seen = d.prepare('SELECT * FROM inbox WHERE job_id = ? AND dedupe_key = ?').get(jobId, dedupeKey)
+    if (seen) return { event: hydrateInbox(seen), duplicate: true }
+  }
+  const id = randomUUID()
+  d.prepare(`INSERT INTO inbox (id, job_id, source, dedupe_key, payload, status, parent_run_id, note, wait_until, created_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`)
+    .run(id, jobId, source, dedupeKey, toJson(payload), parentRunId, note, waitUntil, now())
+  return { event: getInboxEvent(id), duplicate: false }
+}
+
+export function getInboxEvent (id) {
+  const d = open()
+  return hydrateInbox(d.prepare('SELECT * FROM inbox WHERE id = ? OR id LIKE ? LIMIT 1').get(id, id + '%'))
+}
+
+export function listInbox ({ jobId = null, status = null, limit = 50 } = {}) {
+  const d = open()
+  const where = []
+  const args = []
+  if (jobId) { where.push('i.job_id = ?'); args.push(jobId) }
+  if (status) { where.push('i.status = ?'); args.push(status) }
+  const sql = `SELECT i.*, j.name AS job_name FROM inbox i LEFT JOIN jobs j ON j.id = i.job_id
+               ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY i.created_at DESC LIMIT ?`
+  return d.prepare(sql).all(...args, limit).map(hydrateInbox)
+}
+
+export function inboxCounts () {
+  const rows = open().prepare('SELECT status, COUNT(*) AS n FROM inbox GROUP BY status').all()
+  const counts = { pending: 0, claimed: 0, done: 0, dropped: 0 }
+  for (const row of rows) counts[row.status] = row.n
+  return counts
+}
+
+// Jobs with something waiting, oldest event first, skipping the ones that were
+// asked to wait after a ceiling or a hit quota.
+export function jobsWithPendingInbox (at = now()) {
+  return open().prepare(`SELECT i.job_id AS job_id, MIN(i.created_at) AS oldest FROM inbox i
+                         JOIN jobs j ON j.id = i.job_id
+                         WHERE i.status = 'pending' AND j.enabled = 1
+                           AND (i.wait_until IS NULL OR i.wait_until <= ?)
+                         GROUP BY i.job_id ORDER BY oldest`).all(at).map((r) => r.job_id)
+}
+
+// One inbox, one worker. A claim is refused while an earlier event of the same
+// job is still open, so two ticks can never work the same inbox at once.
+export function claimInboxEvent (jobId, { at = now() } = {}) {
+  const d = open()
+  const busy = d.prepare("SELECT id FROM inbox WHERE job_id = ? AND status = 'claimed' LIMIT 1").get(jobId)
+  if (busy) return null
+  const row = d.prepare(`SELECT * FROM inbox WHERE job_id = ? AND status = 'pending'
+                         AND (wait_until IS NULL OR wait_until <= ?)
+                         ORDER BY created_at LIMIT 1`).get(jobId, at)
+  if (!row) return null
+  d.prepare("UPDATE inbox SET status = 'claimed', claimed_at = ? WHERE id = ? AND status = 'pending'").run(at, row.id)
+  const claimed = getInboxEvent(row.id)
+  return claimed?.status === 'claimed' ? claimed : null
+}
+
+export function settleInboxEvent (id, status, { runId = undefined, note = undefined, waitUntil = null } = {}) {
+  const d = open()
+  const event = getInboxEvent(id)
+  if (!event) throw new Error(`no such inbox event: ${id}`)
+  d.prepare('UPDATE inbox SET status = ?, run_id = ?, note = ?, wait_until = ?, settled_at = ? WHERE id = ?')
+    .run(status, runId === undefined ? event.run_id : runId, note === undefined ? event.note : note,
+      waitUntil, status === 'pending' || status === 'claimed' ? null : now(), event.id)
+  return getInboxEvent(event.id)
+}
+
+export function attachInboxRun (id, runId) {
+  open().prepare('UPDATE inbox SET run_id = ? WHERE id = ?').run(runId, id)
+  return getInboxEvent(id)
+}
+
+export function inboxEventForRun (runId) {
+  return hydrateInbox(open().prepare('SELECT * FROM inbox WHERE run_id = ? LIMIT 1').get(runId))
+}
+
+// A scheduler killed mid run leaves a claim nobody holds any more. The next
+// start hands those events back, except the ones parked in front of a human.
+export function releaseClaimedInboxEvents () {
+  const d = open()
+  const rows = d.prepare(`SELECT i.id FROM inbox i LEFT JOIN runs r ON r.id = i.run_id
+                          WHERE i.status = 'claimed'
+                            AND (r.id IS NULL OR r.status NOT IN ('awaiting_approval', 'running'))`).all()
+  for (const row of rows) {
+    d.prepare("UPDATE inbox SET status = 'pending', claimed_at = NULL WHERE id = ?").run(row.id)
+  }
+  return rows.length
+}
+
+export function pruneInbox (days) {
+  const cutoff = now() - days * 86400 * 1000
+  return open().prepare("DELETE FROM inbox WHERE created_at < ? AND status IN ('done', 'dropped')").run(cutoff).changes
+}
+
+/* ---------- memory ---------- */
+
+// Memory lives beside the job, not inside the run, so a crashed agent loses
+// nothing and a replaced agent starts where the last one stopped. Provenance
+// is on every row, because a memory that can be written can be poisoned.
+export function setMemory ({ jobId, key, value, kind = 'note', source = null, runId = null }) {
+  const d = open()
+  d.prepare(`INSERT INTO memory (job_id, key, value, kind, source, run_id, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(job_id, key) DO UPDATE SET value = excluded.value, kind = excluded.kind,
+               source = excluded.source, run_id = excluded.run_id, updated_at = excluded.updated_at`)
+    .run(jobId, key, String(value), kind, source, runId, now())
+  return getMemory(jobId, key)
+}
+
+export function getMemory (jobId, key) {
+  return open().prepare('SELECT * FROM memory WHERE job_id = ? AND key = ?').get(jobId, key) ?? null
+}
+
+export function listMemory (jobId) {
+  return open().prepare('SELECT * FROM memory WHERE job_id = ? ORDER BY key').all(jobId)
+}
+
+export function deleteMemory (jobId, key) {
+  return open().prepare('DELETE FROM memory WHERE job_id = ? AND key = ?').run(jobId, key).changes
+}
+
+export function memoryCount (jobId = null) {
+  return jobId
+    ? open().prepare('SELECT COUNT(*) AS n FROM memory WHERE job_id = ?').get(jobId).n
+    : open().prepare('SELECT COUNT(*) AS n FROM memory').get().n
+}
+
+/* ---------- outbox ---------- */
+
+// Finished work waits here instead of leaving on its own. The shop floor starts
+// quiet, so a pending entry is the normal state and sending is a decision.
+export function addOutboxEntry ({ jobId = null, runId = null, channel, recipient = null, subject = null,
+  body, status = 'pending', dedupeKey = null, note = null }) {
+  const d = open()
+  if (dedupeKey) {
+    const seen = d.prepare('SELECT * FROM outbox WHERE job_id IS ? AND dedupe_key = ?').get(jobId, dedupeKey)
+    if (seen) return { entry: seen, duplicate: true }
+  }
+  const id = randomUUID()
+  d.prepare(`INSERT INTO outbox (id, job_id, run_id, channel, recipient, subject, body, status, dedupe_key, note, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, jobId, runId, channel, recipient, subject, String(body), status, dedupeKey, note, now())
+  return { entry: getOutboxEntry(id), duplicate: false }
+}
+
+export function getOutboxEntry (id) {
+  const d = open()
+  return d.prepare(`SELECT o.*, j.name AS job_name FROM outbox o LEFT JOIN jobs j ON j.id = o.job_id
+                    WHERE o.id = ? OR o.id LIKE ? LIMIT 1`).get(id, id + '%') ?? null
+}
+
+export function listOutbox ({ jobId = null, status = null, limit = 50 } = {}) {
+  const d = open()
+  const where = []
+  const args = []
+  if (jobId) { where.push('o.job_id = ?'); args.push(jobId) }
+  if (status) { where.push('o.status = ?'); args.push(status) }
+  const sql = `SELECT o.*, j.name AS job_name FROM outbox o LEFT JOIN jobs j ON j.id = o.job_id
+               ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY o.created_at LIMIT ?`
+  return d.prepare(sql).all(...args, limit)
+}
+
+export function outboxCounts () {
+  const rows = open().prepare('SELECT status, COUNT(*) AS n FROM outbox GROUP BY status').all()
+  const counts = { pending: 0, sent: 0, held: 0 }
+  for (const row of rows) counts[row.status] = row.n
+  return counts
+}
+
+export function updateOutboxEntry (id, patch) {
+  const d = open()
+  const entry = getOutboxEntry(id)
+  if (!entry) throw new Error(`no such outbox entry: ${id}`)
+  const fields = []
+  const values = []
+  const map = { status: 'status', note: 'note', sentAt: 'sent_at', approvalId: 'approval_id' }
+  for (const [key, column] of Object.entries(map)) {
+    if (patch[key] !== undefined) { fields.push(`${column} = ?`); values.push(patch[key]) }
+  }
+  if (!fields.length) return entry
+  d.prepare(`UPDATE outbox SET ${fields.join(', ')} WHERE id = ?`).run(...values, entry.id)
+  return getOutboxEntry(entry.id)
+}
+
+export function lastOutboxSentAt () {
+  return open().prepare("SELECT MAX(sent_at) AS at FROM outbox WHERE status = 'sent'").get().at ?? null
+}
+
+export function pruneOutbox (days) {
+  const cutoff = now() - days * 86400 * 1000
+  return open().prepare("DELETE FROM outbox WHERE created_at < ? AND status = 'sent'").run(cutoff).changes
 }

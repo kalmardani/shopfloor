@@ -12,7 +12,16 @@ export default {
     const result = await runCommand({
       command,
       cwd: payload.cwd || worker.config.cwd || process.cwd(),
-      env: { ...(worker.config.env || {}), ...(payload.env || {}), SHOPFLOOR_JOB: job?.name || '' },
+      env: {
+        ...(worker.config.env || {}),
+        ...(payload.env || {}),
+        SHOPFLOOR_JOB: job?.name || '',
+        // A script reads what the job knows and what woke it up from the
+        // environment, which keeps the adapter free of any prompt idea.
+        SHOPFLOOR_MEMORY: (payload.memory || '').slice(0, 8000),
+        SHOPFLOOR_EVENT: payload.event ? JSON.stringify(payload.event).slice(0, 8000) : '',
+        SHOPFLOOR_EVENT_SOURCE: payload.event?.source || '',
+      },
       timeoutSec,
       signal,
     })

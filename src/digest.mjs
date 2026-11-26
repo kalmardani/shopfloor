@@ -35,6 +35,18 @@ export function buildDigest ({ hours = 24, at = Date.now() } = {}) {
     lines.push('')
   }
 
+  const inbox = db.inboxCounts()
+  const outbox = db.outboxCounts()
+  if (inbox.pending || inbox.claimed || outbox.pending || outbox.held) {
+    lines.push('## The two queues')
+    if (inbox.pending || inbox.claimed) lines.push(`- inbox ${inbox.pending} waiting, ${inbox.claimed} in hand`)
+    if (outbox.pending || outbox.held) {
+      const quiet = loadConfig().outboxSend ? '' : ', and sending is off'
+      lines.push(`- outbox ${outbox.pending} pending, ${outbox.held} held${quiet}`)
+    }
+    lines.push('')
+  }
+
   lines.push(`## Last ${hours} hours`)
   lines.push(`- ${runs.length} run(s): ${Object.entries(byStatus).map(([k, v]) => `${v} ${k}`).join(', ') || 'none'}`)
   lines.push(`- cost ${cost.toFixed(2)} USD, today ${db.costSince(startOfToday()).toFixed(2)} USD of ${loadConfig().maxUsdPerDay} USD`)

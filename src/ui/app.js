@@ -74,10 +74,66 @@ function render () {
   badge.textContent = state.approvals.length
   badge.classList.toggle('hidden', state.approvals.length === 0)
 
+  const waitingOut = state.outbox.counts.pending + state.outbox.counts.held
+  el('meter-queues').textContent = `inbox ${state.inbox.counts.pending} · outbox ${waitingOut}${state.outbox.sending ? '' : ' · quiet'}`
+  const queueBadge = el('badge-queues')
+  queueBadge.textContent = state.inbox.counts.pending + waitingOut
+  queueBadge.classList.toggle('hidden', state.inbox.counts.pending + waitingOut === 0)
+
   if (view === 'board') renderBoard()
   if (view === 'approvals') renderApprovals()
+  if (view === 'queues') renderQueues()
   if (view === 'runs') renderRuns()
   if (view === 'workers') renderWorkers()
+}
+
+// The inbox on the left of the eye, the outbox under it. Both are lists of
+// things that have not happened yet, which is why they share one view.
+function renderQueues () {
+  const pending = state.inbox.pending
+  const waiting = state.outbox.waiting
+  el('view-queues').innerHTML = `
+    <h2>Inbox</h2>
+    <p class="meta">pending ${state.inbox.counts.pending} · claimed ${state.inbox.counts.claimed} · done ${state.inbox.counts.done} · dropped ${state.inbox.counts.dropped}</p>
+    ${pending.length === 0 ? '<p class="empty">Nothing is waiting to be picked up.</p>' : `<table><thead><tr>
+      <th>arrived</th><th>job</th><th>source</th><th>what</th><th></th></tr></thead><tbody>
+      ${pending.map((e) => `<tr>
+        <td>${esc(ago(e.created_at))}</td>
+        <td>${esc(e.job_name || '—')}</td>
+        <td><span class="tag">${esc(e.source)}</span></td>
+        <td>${esc(String(typeof e.payload.message === 'string' ? e.payload.message : JSON.stringify(e.payload)).slice(0, 90))}</td>
+        <td><button class="btn quiet" data-drop="${esc(e.id)}">Drop</button></td></tr>`).join('')}
+      </tbody></table>`}
+
+    <h2>Outbox</h2>
+    <p class="meta">${state.outbox.sending ? 'sending is on' : 'the shop floor is quiet, nothing goes out on its own'} · pending ${state.outbox.counts.pending} · held ${state.outbox.counts.held} · sent ${state.outbox.counts.sent}</p>
+    ${waiting.length === 0 ? '<p class="empty">Nothing is waiting to go out.</p>' : `<div class="cards">${waiting.map((o) => `<article class="card">
+        <div class="row"><h3>${esc(o.subject || o.channel)}</h3><span class="tag ${esc(o.status)}">${esc(o.status)}</span></div>
+        <div class="meta">${esc(o.job_name || '—')} · ${esc(o.channel)} · to ${esc(o.recipient || 'nobody in particular')}</div>
+        ${o.note ? `<div class="meta">${esc(o.note)}</div>` : ''}
+        <pre>${esc(o.body)}${o.bodyChars > o.body.length ? '\n…' : ''}</pre>
+        <div class="actions">
+          <button class="btn primary" data-send="${esc(o.id)}">Send now</button>
+          ${o.status === 'held' ? `<button class="btn" data-retry="${esc(o.id)}">Back in the queue</button>` : `<button class="btn" data-hold="${esc(o.id)}">Hold</button>`}
+        </div></article>`).join('')}</div>`}`
+
+  el('view-queues').querySelectorAll('[data-drop]').forEach((btn) => btn.addEventListener('click', async () => {
+    try { await api(`/api/inbox/${btn.dataset.drop}/drop`, { method: 'POST', body: {} }); refresh() } catch (err) { alert(err.message) }
+  }))
+  el('view-queues').querySelectorAll('[data-send]').forEach((btn) => btn.addEventListener('click', async () => {
+    btn.disabled = true
+    try {
+      const out = await api(`/api/outbox/${btn.dataset.send}/send`, { method: 'POST', body: { force: true } })
+      if (!out.ok) alert(out.reason || 'it did not go out')
+      refresh()
+    } catch (err) { alert(err.message) } finally { btn.disabled = false }
+  }))
+  el('view-queues').querySelectorAll('[data-retry]').forEach((btn) => btn.addEventListener('click', async () => {
+    try { await api(`/api/outbox/${btn.dataset.retry}/retry`, { method: 'POST', body: {} }); refresh() } catch (err) { alert(err.message) }
+  }))
+  el('view-queues').querySelectorAll('[data-hold]').forEach((btn) => btn.addEventListener('click', async () => {
+    try { await api(`/api/outbox/${btn.dataset.hold}/hold`, { method: 'POST', body: {} }); refresh() } catch (err) { alert(err.message) }
+  }))
 }
 
 function renderBoard () {
@@ -119,6 +175,7 @@ function jobCard (job) {
     </div>
     <div class="meta">${esc(job.worker || '?')} · ${esc(job.adapter || '?')} · ${esc(job.schedule)}${job.requires_approval ? ' · approval gate' : ''}</div>
     <div class="meta">last ${last ? ago(last.at) : 'never'} · next ${job.enabled ? when(job.next_at) : 'switched off'}</div>
+    ${waitingFor(job.name) ? `<div class="meta">${waitingFor(job.name)} in its inbox</div>` : ''}
     ${job.goal ? `<div class="meta">${esc(job.goal)}</div>` : ''}
     ${job.problems.length ? `<ul class="problems">${job.problems.map((p) => `<li>${esc(p.message)}</li>`).join('')}</ul>` : ''}
     <div class="actions">
@@ -127,6 +184,10 @@ function jobCard (job) {
       <button class="btn quiet" data-toggle="${esc(job.id)}" data-enabled="${job.enabled}">${job.enabled ? 'Switch off' : 'Switch on'}</button>
     </div>
   </article>`
+}
+
+function waitingFor (jobName) {
+  return state.inbox.pending.filter((e) => e.job_name === jobName).length || 0
 }
 
 function renderApprovals () {

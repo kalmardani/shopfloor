@@ -1,4 +1,5 @@
 import { runCommand, looksLikeQuotaProblem } from './spawn.mjs'
+import { promptWithContext } from '../memory.mjs'
 
 // Codex CLI on this machine. It reads the sign in the CLI already holds in
 // ~/.codex/auth.json, so a ChatGPT plan is enough and no API key is needed.
@@ -19,7 +20,7 @@ export default {
     args.push('--sandbox', sandbox)
     const model = payload.model || cfg.model
     if (model) args.push('--model', model)
-    args.push(prompt)
+    args.push(promptWithContext(payload, prompt))
 
     const result = await runCommand({
       command: cfg.cli || 'codex',

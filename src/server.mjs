@@ -8,6 +8,7 @@ import { startJob, runApproved, budgetState } from './runner.mjs'
 import { shopHealth } from './health.mjs'
 import { buildDigest } from './digest.mjs'
 import { adapterNames } from './adapters/index.mjs'
+import { dispatchOutbox, sendOne, retryOutbox } from './outbox.mjs'
 import { parseSchedule, nextRun } from './schedule.mjs'
 
 const UI_DIR = join(dirname(fileURLToPath(import.meta.url)), 'ui')
@@ -26,6 +27,25 @@ export function createApp ({ config = loadConfig() } = {}) {
         if (!job) return send(res, 404, { error: 'unknown heartbeat token' })
         db.recordHeartbeat(job.id, url.searchParams.get('note'))
         return send(res, 200, { ok: true, job: job.name })
+      }
+
+      // The webhook door. Its own secret again, because the system on the
+      // other side has one curl and no headers, and a POST only, so a browser
+      // that wanders in cannot queue work.
+      const inbox = path.match(/^\/in\/([a-f0-9]{8,})$/)
+      if (inbox) {
+        const job = db.getJobByInboxToken(inbox[1])
+        if (!job) return send(res, 404, { error: 'unknown inbox token' })
+        if (req.method !== 'POST') return send(res, 405, { error: 'post the event here' })
+        const body = await readJsonBody(req)
+        const { event, duplicate } = db.addInboxEvent({
+          jobId: job.id,
+          source: 'webhook',
+          payload: body,
+          dedupeKey: url.searchParams.get('key') || body.dedupeKey || null,
+        })
+        if (!duplicate) db.addEvent({ level: 'info', kind: 'inbox:webhook', jobId: job.id, message: `event ${event.id.slice(0, 8)} arrived` })
+        return send(res, duplicate ? 200 : 201, { ok: true, job: job.name, event: event.id, duplicate })
       }
 
       if (path.startsWith('/api/')) {
@@ -71,6 +91,13 @@ async function api (req, res, { path, url, config }) {
       runs: db.listRuns({ limit: 40 }).map(stripOutput),
       events: db.listEvents({ limit: 40 }),
       adapters: adapterNames,
+      inbox: { counts: db.inboxCounts(), pending: db.listInbox({ status: 'pending', limit: 20 }) },
+      outbox: {
+        counts: db.outboxCounts(),
+        sending: config.outboxSend === true,
+        waiting: db.listOutbox({ limit: 20 }).filter((o) => o.status !== 'sent').map(shortBody),
+      },
+      memory: db.memoryCount(),
     })
   }
 
@@ -109,6 +136,16 @@ async function api (req, res, { path, url, config }) {
     if (method === 'POST' && id && (action === 'approve' || action === 'reject')) {
       const approval = db.decideApproval(id, action === 'approve' ? 'approved' : 'rejected', { by: body.by || 'web', note: body.note || null })
       db.addEvent({ level: 'info', kind: `approval:${approval.state}`, jobId: approval.job_id, runId: approval.run_id, message: body.note || approval.state })
+      // An outbox decision is about one entry. The run behind it finished long
+      // ago, so nothing is started here.
+      if (approval.kind === 'outbox') {
+        if (approval.state === 'rejected') {
+          db.updateOutboxEntry(approval.outbox_id, { status: 'held', note: body.note || 'a human said no' })
+          return send(res, 200, { approval, entry: db.getOutboxEntry(approval.outbox_id) })
+        }
+        const result = await sendOne(approval.outbox_id, { config })
+        return send(res, 200, { approval, entry: db.getOutboxEntry(approval.outbox_id), sent: result.ok, reason: result.reason || null })
+      }
       if (approval.state === 'approved' && body.now !== false) {
         const run = await runApproved(approval.id, { config })
         return send(res, 200, { approval, run: stripOutput(run) })
@@ -117,6 +154,80 @@ async function api (req, res, { path, url, config }) {
         db.updateRun(approval.run_id, { status: 'rejected', endedAt: Date.now(), summary: body.note || 'rejected by a human' })
       }
       return send(res, 200, { approval })
+    }
+  }
+
+  if (section === 'inbox') {
+    if (method === 'GET' && !id) {
+      return send(res, 200, db.listInbox({
+        jobId: url.searchParams.get('job') ? db.getJob(url.searchParams.get('job'))?.id : null,
+        status: url.searchParams.get('status'),
+        limit: Number(url.searchParams.get('limit') || 50),
+      }))
+    }
+    if (method === 'GET' && id) return send(res, 200, db.getInboxEvent(id))
+    if (method === 'POST' && !id) {
+      const job = db.getJob(body.job)
+      if (!job) return send(res, 404, { error: `no such job: ${body.job}` })
+      const { event, duplicate } = db.addInboxEvent({
+        jobId: job.id,
+        source: body.source || 'message',
+        payload: body.payload || (body.message ? { message: body.message } : {}),
+        dedupeKey: body.dedupeKey || null,
+      })
+      return send(res, duplicate ? 200 : 201, { event, duplicate })
+    }
+    if (method === 'POST' && id && action === 'drop') {
+      return send(res, 200, db.settleInboxEvent(db.getInboxEvent(id).id, 'dropped', { note: body.note || 'dropped by hand' }))
+    }
+  }
+
+  if (section === 'memory') {
+    const job = id ? db.getJob(id) : null
+    if (method === 'GET' && job) return send(res, 200, db.listMemory(job.id))
+    if (method === 'POST' && job) {
+      return send(res, 201, db.setMemory({
+        jobId: job.id,
+        key: body.key,
+        value: body.value,
+        kind: body.kind === 'pointer' ? 'pointer' : 'note',
+        source: body.source || 'web',
+      }))
+    }
+    if (method === 'DELETE' && job) return send(res, 200, { deleted: db.deleteMemory(job.id, url.searchParams.get('key')) })
+  }
+
+  if (section === 'outbox') {
+    if (method === 'GET' && !id) {
+      return send(res, 200, db.listOutbox({
+        jobId: url.searchParams.get('job') ? db.getJob(url.searchParams.get('job'))?.id : null,
+        status: url.searchParams.get('status'),
+        limit: Number(url.searchParams.get('limit') || 50),
+      }))
+    }
+    if (method === 'GET' && id) return send(res, 200, db.getOutboxEntry(id))
+    if (method === 'POST' && !id && !action) {
+      const job = body.job ? db.getJob(body.job) : null
+      const { entry, duplicate } = db.addOutboxEntry({
+        jobId: job?.id || null,
+        channel: body.channel || 'note',
+        recipient: body.recipient || null,
+        subject: body.subject || null,
+        body: body.body || '',
+        dedupeKey: body.dedupeKey || null,
+      })
+      return send(res, duplicate ? 200 : 201, { entry, duplicate })
+    }
+    if (method === 'POST' && id === 'dispatch') return send(res, 200, await dispatchOutbox({ config }))
+    if (method === 'POST' && id && action === 'send') {
+      const entry = db.getOutboxEntry(id)
+      if (!entry) return send(res, 404, { error: `no such outbox entry: ${id}` })
+      const result = await sendOne(entry.id, { config, force: !!body.force })
+      return send(res, 200, { ...result, entry: db.getOutboxEntry(entry.id) })
+    }
+    if (method === 'POST' && id && action === 'retry') return send(res, 200, retryOutbox(id))
+    if (method === 'POST' && id && action === 'hold') {
+      return send(res, 200, db.updateOutboxEntry(db.getOutboxEntry(id).id, { status: 'held', note: body.note || 'held by hand' }))
     }
   }
 
@@ -141,6 +252,12 @@ async function api (req, res, { path, url, config }) {
   }
 
   return send(res, 404, { error: `no such endpoint: ${method} ${path}` })
+}
+
+// The board needs to see that something is waiting, not to carry the whole
+// letter in every poll.
+function shortBody (entry) {
+  return { ...entry, body: String(entry.body || '').slice(0, 400), bodyChars: String(entry.body || '').length }
 }
 
 function stripOutput (run) {

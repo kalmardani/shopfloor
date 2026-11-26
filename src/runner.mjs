@@ -2,6 +2,9 @@ import { getAdapter } from './adapters/index.mjs'
 import { loadConfig } from './config.mjs'
 import * as db from './db.mjs'
 import { nextRun } from './schedule.mjs'
+import { memoryBlock, applyMemoryWrites } from './memory.mjs'
+import { parseDirectives } from './directives.mjs'
+import { queueFromRun } from './outbox.mjs'
 
 const startOfToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime() }
 
@@ -21,16 +24,26 @@ export function budgetState (worker, config = loadConfig()) {
   }
 }
 
-// One run, start to finish: the gates in front of it, the adapter call, and
-// the record left behind. Returns the stored run row.
-export async function executeRun ({ run, job, worker, config = loadConfig(), signal = null }) {
+// One run, start to finish. The gates in front of it, what the job knows, the
+// adapter call, and the record left behind. Returns the stored run row.
+export async function executeRun ({ run, job, worker, config = loadConfig(), signal = null, event = null }) {
   const timeoutSec = job?.timeout_sec || config.defaultTimeoutSec
+  const inboxEvent = event ?? db.inboxEventForRun(run.id)
   db.updateRun(run.id, { status: 'running', startedAt: Date.now() })
+
+  // What the job knows and what woke it up travel together, in the payload, so
+  // an adapter needs no knowledge of either store.
+  const payload = {
+    ...(job?.payload || {}),
+    ...(inboxEvent?.payload || {}),
+    memory: memoryBlock(job, { config }),
+    event: inboxEvent ? { id: inboxEvent.id, source: inboxEvent.source, payload: inboxEvent.payload } : null,
+  }
 
   let result
   try {
     const adapter = getAdapter(worker.adapter)
-    result = await adapter.run({ worker, job, payload: job?.payload || {}, timeoutSec, signal })
+    result = await adapter.run({ worker, job, payload, timeoutSec, signal })
   } catch (err) {
     result = { exitCode: null, stdout: '', stderr: String(err?.stack || err?.message || err), costUsd: 0, summary: 'the adapter threw', error: String(err?.message || err) }
   }
@@ -68,20 +81,68 @@ export async function executeRun ({ run, job, worker, config = loadConfig(), sig
         : `${status}${result.exitCode === null ? '' : ' (exit ' + result.exitCode + ')'}: ${(result.stderr || result.summary || '').trim().slice(0, 300)}`,
     })
 
+    if (status === 'ok') applyRunDirectives({ run: stored, job, result, config })
+
     if (status === 'quota') {
       // Nothing is wrong with the job, the plan is simply out of room for now.
       db.setNextAt(job.id, Date.now() + config.retryAfterQuotaSec * 1000)
-    } else {
+    } else if (!inboxEvent || inboxEvent.source === 'timer') {
+      // An event driven run keeps its hands off the timer, because the slot
+      // belongs to the schedule and not to whatever just arrived.
       db.setNextAt(job.id, nextRun(job.schedule, Date.now()))
+    }
+  }
+
+  if (inboxEvent && inboxEvent.status === 'claimed') {
+    if (status === 'quota') {
+      // The arrival is not the problem, so it waits rather than counting as done.
+      db.settleInboxEvent(inboxEvent.id, 'pending', {
+        runId: run.id,
+        note: 'the plan was out of room, back in the queue',
+        waitUntil: Date.now() + config.retryAfterQuotaSec * 1000,
+      })
+    } else {
+      db.settleInboxEvent(inboxEvent.id, 'done', { runId: run.id, note: `run ended ${status}` })
     }
   }
 
   return stored
 }
 
+// What the run asked for in its own output. Memory writes, replies into an
+// inbox, entries in the outbox. Only a run that ended well is believed, since
+// half of a crashed answer is not an instruction.
+function applyRunDirectives ({ run, job, result, config }) {
+  const directives = parseDirectives(result.stdout || '')
+  applyMemoryWrites(job, directives, { runId: run.id, source: 'run', config })
+  queueFromRun({ job, run, directives, config })
+
+  for (const reply of directives.replies) {
+    const target = reply.job ? db.getJob(reply.job) : job
+    if (!target) {
+      db.addEvent({ level: 'warn', kind: 'inbox:unknown', jobId: job.id, runId: run.id, message: `no job called ${reply.job}` })
+      continue
+    }
+    const { event, duplicate } = db.addInboxEvent({
+      jobId: target.id,
+      source: 'reply',
+      payload: { message: reply.message, fromJob: job.name },
+      parentRunId: run.id,
+      dedupeKey: `reply:${run.id}:${target.id}:${reply.message.slice(0, 60)}`,
+    })
+    if (!duplicate) {
+      db.addEvent({ level: 'info', kind: 'inbox:reply', jobId: target.id, runId: run.id, message: `${job.name} left work for ${target.name} (${event.id.slice(0, 8)})` })
+    }
+  }
+
+  for (const problem of directives.errors) {
+    db.addEvent({ level: 'warn', kind: 'directive:unreadable', jobId: job.id, runId: run.id, message: problem })
+  }
+}
+
 // Start a job now. Honours the approval gate and the day's budget, which is
 // why it is used by the scheduler, the CLI and the web interface alike.
-export async function startJob (jobRef, { trigger = 'manual', force = false, config = loadConfig(), signal = null } = {}) {
+export async function startJob (jobRef, { trigger = 'manual', force = false, config = loadConfig(), signal = null, event = null } = {}) {
   const job = typeof jobRef === 'string' ? db.getJob(jobRef) : jobRef
   if (!job) throw new Error(`no such job: ${jobRef}`)
   const worker = db.getWorker(job.worker_id)
@@ -92,6 +153,9 @@ export async function startJob (jobRef, { trigger = 'manual', force = false, con
     const run = db.createRun({ jobId: job.id, workerId: worker.id, status: 'awaiting_approval', trigger })
     const approval = db.createApproval({ runId: run.id, jobId: job.id, question: job.goal || `Run ${job.name}?` })
     db.addEvent({ level: 'warn', kind: 'approval:requested', jobId: job.id, runId: run.id, message: `waiting for a decision (${approval.id.slice(0, 8)})` })
+    // The event stays claimed while a person thinks about it, which is how the
+    // inbox keeps one worker and does not start the same work twice.
+    if (event) db.attachInboxRun(event.id, run.id)
     db.setNextAt(job.id, nextRun(job.schedule, Date.now()))
     return { run: db.getRun(run.id), approval, started: false }
   }
@@ -104,11 +168,14 @@ export async function startJob (jobRef, { trigger = 'manual', force = false, con
     db.updateRun(run.id, { endedAt: Date.now(), summary: which })
     db.addEvent({ level: 'warn', kind: 'run:blocked', jobId: job.id, runId: run.id, message: which })
     db.setNextAt(job.id, nextRun(job.schedule, Date.now()))
+    if (event) {
+      db.settleInboxEvent(event.id, 'pending', { runId: run.id, note: which, waitUntil: Date.now() + config.retryAfterQuotaSec * 1000 })
+    }
     return { run: db.getRun(run.id), started: false, blocked: which }
   }
 
   const run = db.createRun({ jobId: job.id, workerId: worker.id, status: 'queued', trigger })
-  const finished = await executeRun({ run, job, worker, config, signal })
+  const finished = await executeRun({ run, job, worker, config, signal, event })
   return { run: finished, started: true }
 }
 
@@ -118,7 +185,9 @@ export async function runApproved (approvalId, { config = loadConfig() } = {}) {
   const approval = db.getApproval(approvalId)
   if (!approval) throw new Error(`no such approval: ${approvalId}`)
   if (approval.state !== 'approved') throw new Error(`approval is ${approval.state}, not approved`)
+  if (approval.kind !== 'run') throw new Error(`approval ${approval.id.slice(0, 8)} guards an ${approval.kind}, not a run`)
   const run = db.getRun(approval.run_id)
+  if (run && run.status !== 'awaiting_approval') throw new Error(`that run already ended ${run.status}`)
   const job = db.getJob(approval.job_id)
   const worker = db.getWorker(run.worker_id)
   return executeRun({ run, job, worker, config })

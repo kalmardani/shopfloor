@@ -19,6 +19,16 @@ const DEFAULTS = {
   keepRunDays: 90,
   notifyCommand: null,
   digestAt: '07:30',
+  // The shop floor starts quiet. Nothing in the outbox leaves the machine
+  // until outboxSend is switched on and a command is there to carry it.
+  outboxSend: false,
+  outboxCommand: null,
+  outboxRequiresApproval: true,
+  outboxPerTick: 1,
+  outboxMinGapSec: 60,
+  outboxTimeoutSec: 120,
+  memoryValueChars: 2000,
+  memoryBlockChars: 4000,
 }
 
 export function ensureHome () {

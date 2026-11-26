@@ -14,7 +14,7 @@ export default {
       const res = await fetch(url, {
         method: payload.method || cfg.method || 'POST',
         headers: { 'content-type': 'application/json', ...(cfg.headers || {}), ...(payload.headers || {}) },
-        body: JSON.stringify({ job: job?.name, ...payload.body }),
+        body: JSON.stringify({ job: job?.name, event: payload.event || null, ...payload.body }),
         signal: controller.signal,
       })
       const text = (await res.text()).slice(0, 20000)

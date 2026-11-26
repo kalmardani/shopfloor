@@ -15,6 +15,7 @@
   <div class="meters">
     <span id="meter-attention" class="meter">—</span>
     <span id="meter-spend" class="meter">—</span>
+    <span id="meter-queues" class="meter muted">—</span>
     <span id="meter-clock" class="meter muted">—</span>
   </div>
 </header>
@@ -22,6 +23,7 @@
 <nav class="tabs" role="tablist">
   <button class="tab is-on" data-view="board" role="tab">Board</button>
   <button class="tab" data-view="approvals" role="tab">Approvals <span id="badge-approvals" class="badge hidden">0</span></button>
+  <button class="tab" data-view="queues" role="tab">Queues <span id="badge-queues" class="badge hidden">0</span></button>
   <button class="tab" data-view="runs" role="tab">Runs</button>
   <button class="tab" data-view="workers" role="tab">Workers</button>
   <button class="tab" data-view="digest" role="tab">Digest</button>
@@ -30,6 +32,7 @@
 <main>
   <section id="view-board" class="view"></section>
   <section id="view-approvals" class="view hidden"></section>
+  <section id="view-queues" class="view hidden"></section>
   <section id="view-runs" class="view hidden"></section>
   <section id="view-workers" class="view hidden"></section>
   <section id="view-digest" class="view hidden"></section>
