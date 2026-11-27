@@ -162,7 +162,7 @@ A headless agent run has nobody to click an allow button. Give `claude_local` an
 
 ## Roles
 
-Sam Oh of Ahrefs gave each of his agents a whole job and a weekly call, and the first one was a Head of Organic SEO. A role in Shopfloor is that arrangement on a single machine. The job ad lives in a Markdown file, and `shopfloor role hire` turns it into a `claude_local` worker with the day cap of the ad and a job on its cadence, switched off until you say so.
+A role gives an agent a whole job instead of a single task, with a number to move, a budget, and a weekly review where a person looks at the results and corrects the course. The job ad lives in a Markdown file, and `shopfloor role hire` turns it into a `claude_local` worker with the day cap of the ad and a job on its cadence, switched off until you say so.
 
 ```markdown
 ---
@@ -296,4 +296,4 @@ Not an agent framework. It does not write prompts, split tasks or route between 
 
 ## Licence
 
-MIT. Built by [Kalmár Dániel](https://www.kdconsulting.hu), AI consultant, with Claude Code.
+MIT. Built by [Kalmár Dániel](https://www.kdconsulting.hu), AI consultant.

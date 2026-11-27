@@ -3,10 +3,11 @@ import { loadConfig } from './config.mjs'
 import { movement, formatChange, METRIC_LABELS, round } from './sources/google.mjs'
 import { notify } from './digest.mjs'
 
-// The weekly review of one role, the call Sam Oh has with his agents once a
-// week, written down. What the worker did, what it cost, how the number it is
-// paid to move actually moved, and what a person said yes and no to. Every
-// figure here is counted from the database, none is taken from the agent.
+// The weekly review of one role, the conversation a manager has with someone
+// who works on their own, written down. What the worker did, what it cost, how
+// the number it is paid to move actually moved, and what a person said yes and
+// no to. Every figure here is counted from the database, none is taken from
+// the agent.
 
 const DAY = 86400 * 1000
 const WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']
