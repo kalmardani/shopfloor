@@ -58,7 +58,7 @@ Quota is read from text, in `looksLikeQuotaProblem`, because agent CLIs answer a
 
 ## Adding an adapter
 
-Write a module in `src/adapters/` that exports a default object with `name`, `describe`, `configFields` and an async `run({ worker, job, payload, timeoutSec, signal })`. The payload the runner hands over is the job payload with the arriving event merged over it, plus `memory` as a rendered text block and `event` as the arrival itself. A prompt adapter puts both in front of the prompt through `promptWithContext`, and `process` passes them down as `SHOPFLOOR_MEMORY`, `SHOPFLOOR_EVENT` and `SHOPFLOOR_EVENT_SOURCE`. Return `{ exitCode, stdout, stderr, costUsd, summary, timedOut, aborted, quotaProblem, error }`. Register it in `src/adapters/index.mjs`. Spawn through `runCommand` from `spawn.mjs` so the timeout, the kill escalation and the output cap stay in one place. The run status is decided in `runner.mjs`, not in the adapter.
+Write a module in `src/adapters/` that exports a default object with `name`, `describe`, `configFields` and an async `run({ worker, job, payload, timeoutSec, signal })`. The payload the runner hands over is the job payload, plus `memory` as a rendered text block and `event` as the arrival itself. The arrival is never merged into the payload, so an event can describe work but cannot set `command`, `prompt`, `model` or anything else that decides what runs. A prompt adapter puts both in front of the prompt through `promptWithContext`, and `process` passes them down as `SHOPFLOOR_MEMORY`, `SHOPFLOOR_EVENT` and `SHOPFLOOR_EVENT_SOURCE`. Return `{ exitCode, stdout, stderr, costUsd, summary, timedOut, aborted, quotaProblem, error }`. Register it in `src/adapters/index.mjs`. Spawn through `runCommand` from `spawn.mjs` so the timeout, the kill escalation and the output cap stay in one place. The run status is decided in `runner.mjs`, not in the adapter.
 
 ## Adding a data source to roles
 
@@ -108,7 +108,7 @@ Routes are a flat switch in `src/server.mjs`, read as `/api/<section>/<id>/<acti
 
 **The machine's own Claude settings are not on your side.** A user settings file in `bypassPermissions` mode with `Bash(npx *)` allowed is common on a developer's laptop, and a headless run inherits it. That is why a role passes `--restricted`, `--tools`, `--disallowedTools`, `--strict-mcp-config` and `--permission-mode dontAsk` together. Deny rules win over a bypass mode, and `--tools` removes the tool from the session altogether.
 
-**A role run drops the event payload.** The runner usually spreads the arriving event over the job payload, which lets an event set `prompt` or `command`. For a role everything except `memory` and `event` is cleared before the role payload goes in, so a webhook can describe work but never decide how it is done.
+**An event is data, never configuration.** Anyone who holds an inbox token can post to `/in/<token>`, so the arrival reaches the work only as `payload.event` and is never spread over the job payload. A role goes one step further and clears everything except `memory` and `event` before its own settings go in, so even the job payload cannot widen it.
 
 **A draft asks the gate when it is queued.** Outbox approvals are normally created by `dispatchOutbox`, which never runs while `outboxSend` is off. A draft would then never reach a person, so `screenRoleOutput` creates the approval itself, and `gateFor` asks for one on the draft channel even when `outboxRequiresApproval` is false.
 
@@ -122,7 +122,7 @@ Routes are a flat switch in `src/server.mjs`, read as `/api/<section>/<id>/<acti
 
 ## Tests
 
-`node --test`, sixty five of them. The schedule and directive tests are pure. The lifecycle, queue and http tests each create a temporary `SHOPFLOOR_HOME`, so they never touch a real shop, and they set the environment variable before the dynamic imports, because `config.mjs` reads it at import time. Nothing needs the network, and nothing calls an agent CLI. A delivery in a test is a shell command that appends to a file in the temporary home, which is the same path a real carrier takes. A role test writes a small `fake-claude` executable that records its arguments and answers in the CLI's JSON shape, and swaps the network for a stub with `setRoleFetch`, so the flags, the briefing and the screening are all checked without a model or Google.
+`node --test`, sixty six of them. The schedule and directive tests are pure. The lifecycle, queue and http tests each create a temporary `SHOPFLOOR_HOME`, so they never touch a real shop, and they set the environment variable before the dynamic imports, because `config.mjs` reads it at import time. Nothing needs the network, and nothing calls an agent CLI. A delivery in a test is a shell command that appends to a file in the temporary home, which is the same path a real carrier takes. A role test writes a small `fake-claude` executable that records its arguments and answers in the CLI's JSON shape, and swaps the network for a stub with `setRoleFetch`, so the flags, the briefing and the screening are all checked without a model or Google.
 
 ## Style
 

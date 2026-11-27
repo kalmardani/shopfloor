@@ -35,8 +35,10 @@ export async function executeRun ({ run, job, worker, config = loadConfig(), sig
   // What the job knows and what woke it up travel together, in the payload, so
   // an adapter needs no knowledge of either store.
   const payload = {
+    // The arrival is not merged into the job payload. A webhook that could set
+    // command, prompt, model or cwd would decide what runs on this machine,
+    // so whatever arrived travels only as payload.event, as data.
     ...(job?.payload || {}),
-    ...(inboxEvent?.payload || {}),
     memory: memoryBlock(job, { config }),
     event: inboxEvent ? { id: inboxEvent.id, source: inboxEvent.source, payload: inboxEvent.payload } : null,
   }

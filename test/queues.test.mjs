@@ -279,3 +279,20 @@ test('the counts the board draws add up', () => {
   assert.ok(outbox.sent >= 3)
   assert.ok(db.memoryCount() >= 1)
 })
+
+test('a webhook can describe work but cannot change what runs', async () => {
+  const marker = join(home, 'webhook-ran')
+  const worker = db.createWorker({ name: 'guarded', adapter: 'process', config: { command: 'echo the job command' } })
+  const job = db.createJob({ workerId: worker.id, name: 'guarded-job', schedule: 'manual' })
+  const { event } = db.addInboxEvent({
+    jobId: job.id,
+    source: 'webhook',
+    payload: { message: 'new file', command: `touch ${marker}`, cwd: '/' },
+    dedupeKey: 'hostile-1',
+  })
+  await tick()
+  const run = db.getRun(db.getInboxEvent(event.id).run_id)
+  assert.equal(run.status, 'ok')
+  assert.match(run.stdout, /the job command/, 'the command of the job ran')
+  assert.ok(!existsSync(marker), 'the command from the webhook did not')
+})

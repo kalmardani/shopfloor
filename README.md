@@ -246,7 +246,7 @@ shopfloor config token "$(openssl rand -hex 16)"
 shopfloor config host 0.0.0.0
 ```
 
-The token guards every `/api/` route. The heartbeat route and the webhook door are guarded by their own secrets, because an outside process has to reach them with one `curl` and no headers. The webhook door takes a POST and nothing else, so a browser that wanders in cannot queue work. A job that is fed from outside is a job someone else can wake, which is the reason the outbox starts quiet. Shopfloor runs commands you put in it, so treat the config and the database as what they are, a list of things that will run as you.
+The token guards every `/api/` route. The heartbeat route and the webhook door are guarded by their own secrets, because an outside process has to reach them with one `curl` and no headers. The webhook door takes a POST and nothing else, so a browser that wanders in cannot queue work. A job that is fed from outside is a job someone else can wake, which is the reason the outbox starts quiet. What arrives is handed to the work as data under `event`, and it can never set the command, the prompt or any other setting of the job. Shopfloor runs commands you put in it, so treat the config and the database as what they are, a list of things that will run as you.
 
 ## Configuration
 
@@ -288,7 +288,7 @@ See `examples/shop.json` for the shape.
 node --test
 ```
 
-Sixty five tests over the schedule grammar, the run lifecycle, timeouts, budget ceilings, approval gates, silence detection, heartbeats, the inbox and its dedupe key, memory and its provenance, the outbox with its pacing and its gate, the directive parser, roles with their boundaries, drafts and weekly review, and the http api. No test needs the network, and none calls an agent CLI. A role run in a test talks to a fake `claude` executable and a fake Google.
+Sixty six tests over the schedule grammar, the run lifecycle, timeouts, budget ceilings, approval gates, silence detection, heartbeats, the inbox and its dedupe key, memory and its provenance, the outbox with its pacing and its gate, the directive parser, roles with their boundaries, drafts and weekly review, and the http api. No test needs the network, and none calls an agent CLI. A role run in a test talks to a fake `claude` executable and a fake Google.
 
 ## What it is not
 
