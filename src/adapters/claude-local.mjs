@@ -12,7 +12,8 @@ import { promptWithContext } from '../memory.mjs'
 export default {
   name: 'claude_local',
   describe: 'Runs a prompt through the local Claude Code CLI and reads back the cost it reports.',
-  configFields: ['cli', 'model', 'cwd', 'systemPrompt', 'allowTools', 'skipPermissions', 'addDirs', 'env'],
+  configFields: ['cli', 'model', 'cwd', 'systemPrompt', 'allowTools', 'disallowTools', 'tools', 'restricted',
+    'strictMcp', 'permissionMode', 'maxBudgetUsd', 'skipPermissions', 'addDirs', 'env'],
   async run ({ worker, job, payload, timeoutSec, signal }) {
     const cfg = worker.config || {}
     const prompt = payload.prompt || cfg.prompt
@@ -26,10 +27,22 @@ export default {
     const allowTools = payload.allowTools || cfg.allowTools
     if (Array.isArray(allowTools) && allowTools.length) args.push('--allowedTools', allowTools.join(','))
     for (const dir of payload.addDirs || cfg.addDirs || []) args.push('--add-dir', dir)
+    // The narrowing flags. A role sets all of them, because the user settings
+    // on the machine may run in a bypass mode that a headless run would inherit.
+    const tools = payload.tools ?? cfg.tools
+    if (Array.isArray(tools)) args.push('--tools', tools.join(','))
+    const disallowTools = payload.disallowTools || cfg.disallowTools
+    if (Array.isArray(disallowTools) && disallowTools.length) args.push('--disallowedTools', disallowTools.join(','))
+    if (payload.restricted ?? cfg.restricted) args.push('--restricted')
+    if (payload.strictMcp ?? cfg.strictMcp) args.push('--strict-mcp-config')
+    const permissionMode = payload.permissionMode || cfg.permissionMode
+    if (permissionMode) args.push('--permission-mode', permissionMode)
+    const maxBudget = payload.maxBudgetUsd ?? cfg.maxBudgetUsd
+    if (maxBudget) args.push('--max-budget-usd', String(maxBudget))
     if (payload.skipPermissions ?? cfg.skipPermissions) args.push('--dangerously-skip-permissions')
 
     const result = await runCommand({
-      command: cfg.cli || 'claude',
+      command: payload.cli || cfg.cli || 'claude',
       args,
       cwd: payload.cwd || cfg.cwd || process.cwd(),
       env: { ...(cfg.env || {}), ...(payload.env || {}), SHOPFLOOR_JOB: job?.name || '' },

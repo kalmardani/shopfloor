@@ -5,6 +5,7 @@ import { nextRun } from './schedule.mjs'
 import { memoryBlock, applyMemoryWrites } from './memory.mjs'
 import { parseDirectives } from './directives.mjs'
 import { queueFromRun } from './outbox.mjs'
+import { prepareRoleRun, screenRoleOutput } from './role.mjs'
 
 const startOfToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime() }
 
@@ -40,12 +41,40 @@ export async function executeRun ({ run, job, worker, config = loadConfig(), sig
     event: inboxEvent ? { id: inboxEvent.id, source: inboxEvent.source, payload: inboxEvent.payload } : null,
   }
 
-  let result
-  try {
-    const adapter = getAdapter(worker.adapter)
-    result = await adapter.run({ worker, job, payload, timeoutSec, signal })
-  } catch (err) {
-    result = { exitCode: null, stdout: '', stderr: String(err?.stack || err?.message || err), costUsd: 0, summary: 'the adapter threw', error: String(err?.message || err) }
+  // A role run gathers its numbers first and carries its boundaries into the
+  // payload, where they override whatever the worker config says.
+  const role = job ? db.getRole(job.id) : null
+  let result = null
+  if (role && worker.adapter !== 'claude_local') {
+    // Only claude_local knows how to narrow a run, so a role on any other
+    // adapter would carry its boundaries in name only.
+    const why = `a role runs on claude_local only, and ${worker.name} is ${worker.adapter}`
+    result = { exitCode: 1, stdout: '', stderr: why, costUsd: 0, summary: why }
+  } else if (role) {
+    try {
+      const budget = budgetState(worker, config)
+      const left = [budget.workerCap === null ? null : budget.workerCap - budget.spentWorker,
+        budget.globalCap === null ? null : budget.globalCap - budget.spentGlobal].filter((v) => v !== null)
+      const prep = await prepareRoleRun({ job, run, role, remainingUsd: left.length ? Math.min(...left) : null })
+      if (prep.stop) result = prep.result
+      else {
+        // Nothing that arrived from outside may set how a role runs. An event
+        // reaches the agent as text under payload.event and nowhere else.
+        for (const key of Object.keys(payload)) if (key !== 'memory' && key !== 'event') delete payload[key]
+        Object.assign(payload, prep.payload)
+      }
+    } catch (err) {
+      result = { exitCode: null, stdout: '', stderr: String(err?.stack || err?.message || err), costUsd: 0, summary: 'the role could not be prepared', error: String(err?.message || err) }
+    }
+  }
+
+  if (!result) {
+    try {
+      const adapter = getAdapter(worker.adapter)
+      result = await adapter.run({ worker, job, payload, timeoutSec, signal })
+    } catch (err) {
+      result = { exitCode: null, stdout: '', stderr: String(err?.stack || err?.message || err), costUsd: 0, summary: 'the adapter threw', error: String(err?.message || err) }
+    }
   }
 
   const status = result.timedOut
@@ -81,7 +110,7 @@ export async function executeRun ({ run, job, worker, config = loadConfig(), sig
         : `${status}${result.exitCode === null ? '' : ' (exit ' + result.exitCode + ')'}: ${(result.stderr || result.summary || '').trim().slice(0, 300)}`,
     })
 
-    if (status === 'ok') applyRunDirectives({ run: stored, job, result, config })
+    if (status === 'ok') await applyRunDirectives({ run: stored, job, result, config, role })
 
     if (status === 'quota') {
       // Nothing is wrong with the job, the plan is simply out of room for now.
@@ -112,8 +141,11 @@ export async function executeRun ({ run, job, worker, config = loadConfig(), sig
 // What the run asked for in its own output. Memory writes, replies into an
 // inbox, entries in the outbox. Only a run that ended well is believed, since
 // half of a crashed answer is not an instruction.
-function applyRunDirectives ({ run, job, result, config }) {
-  const directives = parseDirectives(result.stdout || '')
+async function applyRunDirectives ({ run, job, result, config, role = null }) {
+  let directives = parseDirectives(result.stdout || '')
+  // A role is screened before anything is stored. Its drafts go in front of
+  // the gate, and what it may not do is refused and written down.
+  if (role) directives = (await screenRoleOutput({ job, run, role, directives, config })).directives
   applyMemoryWrites(job, directives, { runId: run.id, source: 'run', config })
   queueFromRun({ job, run, directives, config })
 

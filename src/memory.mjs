@@ -72,6 +72,8 @@ export function applyMemoryWrites (job, directives, { runId = null, source = 'ru
 // the reason this run exists at all.
 export function promptWithContext (payload, prompt) {
   const parts = []
+  // A role briefing comes first of all, because it says who is doing the work.
+  if (payload?.briefing) parts.push(payload.briefing)
   if (payload?.memory) parts.push(payload.memory)
   const event = payload?.event
   if (event && event.source !== 'timer') {

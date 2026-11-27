@@ -12,7 +12,11 @@ src/schedule.mjs       the schedule grammar, next firing time, silence windows
 src/runner.mjs         one run start to finish, budget and approval gates
 src/directives.mjs     what a run can say back through its own output
 src/memory.mjs         what a job knows, and what goes in front of a prompt
-src/outbox.mjs         the outgoing queue, its pacing and its gate
+src/outbox.mjs         the outgoing queue, its pacing and its gate, and the draft carrier
+src/role.mjs           a job ad read into a spec, the agent settings it implies, screening
+src/review.mjs         the weekly review of a role, sent after the digest
+src/sources/google.mjs Search Console and GA4, read only, over fetch, and the data block
+src/sources/google-consent.mjs   the one time sign in that writes a refresh token
 src/scheduler.mjs      the tick loop and the long running serve mode
 src/health.mjs         the question of what went quiet
 src/digest.mjs         the morning text and the notify hand off
@@ -40,6 +44,8 @@ A **memory entry** is one key under one job, with the value, the kind (`note` or
 
 An **outbox entry** is finished work waiting to leave. Channel, recipient, subject, body, and a status of `pending`, `held` or `sent`. Nothing moves until `outboxSend` is on and an `outboxCommand` is there to carry it.
 
+A **role** hangs off a job, one per job. It keeps the job ad as written next to the spec read from it, with a version that goes up on every `role set`. A role snapshot is what the data sources answered for one run, and the weekly review reads the newest one that had data.
+
 A **log event** is the audit trail. Runs, gates, arrivals, memory writes, deliveries, scheduler starts and stops, digests.
 
 A **heartbeat** is the dead man's switch for work that does not run here at all. `GET /hb/<token>` writes a timestamp, and the silence check treats a missing ping like a missing run.
@@ -54,9 +60,13 @@ Quota is read from text, in `looksLikeQuotaProblem`, because agent CLIs answer a
 
 Write a module in `src/adapters/` that exports a default object with `name`, `describe`, `configFields` and an async `run({ worker, job, payload, timeoutSec, signal })`. The payload the runner hands over is the job payload with the arriving event merged over it, plus `memory` as a rendered text block and `event` as the arrival itself. A prompt adapter puts both in front of the prompt through `promptWithContext`, and `process` passes them down as `SHOPFLOOR_MEMORY`, `SHOPFLOOR_EVENT` and `SHOPFLOOR_EVENT_SOURCE`. Return `{ exitCode, stdout, stderr, costUsd, summary, timedOut, aborted, quotaProblem, error }`. Register it in `src/adapters/index.mjs`. Spawn through `runCommand` from `spawn.mjs` so the timeout, the kill escalation and the output cap stay in one place. The run status is decided in `runner.mjs`, not in the adapter.
 
+## Adding a data source to roles
+
+A source is a tool name in `TOOLS` in `src/role.mjs` with `gathered: true`, and a branch in `gatherForRole` in `src/sources/`. It gets the role spec and an injected `fetchImpl`, returns plain numbers, and lets every error message go through `redact` with the secrets it used. Metrics that the review should know go into `movement` and `METRIC_LABELS`, and a new goal metric into `GOAL_METRICS`. Keep the gathering in Shopfloor and out of the agent, because a credential the agent never sees is one it cannot leak.
+
 ## Adding an api route
 
-Routes are a flat switch in `src/server.mjs`, read as `/api/<section>/<id>/<action>`. The sections are `state`, `workers`, `jobs`, `runs`, `approvals`, `inbox`, `memory`, `outbox`, `events`, `digest`, `health`, `schedule` and `config`. Two routes live outside the api and carry their own secret, `GET /hb/<token>` for the dead man's switch and `POST /in/<token>` for the webhook door. Answer with `send(res, status, payload)`. Keep run output out of list answers through `stripOutput`, because a board that drags megabytes of stdout stops being pleasant. Static files are served only from `src/ui`, and the resolved path is checked against that directory.
+Routes are a flat switch in `src/server.mjs`, read as `/api/<section>/<id>/<action>`. The sections are `state`, `workers`, `jobs`, `runs`, `approvals`, `inbox`, `memory`, `outbox`, `roles`, `events`, `digest`, `health`, `schedule` and `config`. Roles are read only over the api, because a job ad is a file someone writes. Two routes live outside the api and carry their own secret, `GET /hb/<token>` for the dead man's switch and `POST /in/<token>` for the webhook door. Answer with `send(res, status, payload)`. Keep run output out of list answers through `stripOutput`, because a board that drags megabytes of stdout stops being pleasant. Static files are served only from `src/ui`, and the resolved path is checked against that directory.
 
 ## Traps worth knowing
 
@@ -94,11 +104,25 @@ Routes are a flat switch in `src/server.mjs`, read as `/api/<section>/<id>/<acti
 
 **The digest fires once a day from inside the tick.** The guard is a module level `lastDigestDay`, which means a fresh process on the same day can write a second one. `resetDigestMemory` exists for tests.
 
+**A role is enforced twice, at hire and at every run.** `hireRole` writes the narrowing flags into the worker config, and `prepareRoleRun` puts them in the payload again, where they win over the worker config. Editing the worker by hand therefore cannot widen a role, which a test checks by setting `skipPermissions` on the worker and watching it disappear from the command line.
+
+**The machine's own Claude settings are not on your side.** A user settings file in `bypassPermissions` mode with `Bash(npx *)` allowed is common on a developer's laptop, and a headless run inherits it. That is why a role passes `--restricted`, `--tools`, `--disallowedTools`, `--strict-mcp-config` and `--permission-mode dontAsk` together. Deny rules win over a bypass mode, and `--tools` removes the tool from the session altogether.
+
+**A role run drops the event payload.** The runner usually spreads the arriving event over the job payload, which lets an event set `prompt` or `command`. For a role everything except `memory` and `event` is cleared before the role payload goes in, so a webhook can describe work but never decide how it is done.
+
+**A draft asks the gate when it is queued.** Outbox approvals are normally created by `dispatchOutbox`, which never runs while `outboxSend` is off. A draft would then never reach a person, so `screenRoleOutput` creates the approval itself, and `gateFor` asks for one on the draft channel even when `outboxRequiresApproval` is false.
+
+**An approved draft is saved, not sent.** The `draft` channel has its own carrier in `outbox.mjs`, a file in `drafts_dir`, and it works while the shop floor is quiet, because nothing leaves the machine. The role check refuses a `drafts_dir` inside a `site` folder, since `wrangler pages deploy .` and its kind publish everything in the folder.
+
+**The writing check fails closed.** A `style_check` command that cannot run holds the draft as if the text had failed, and the reason is stored under `held_back` in the job's memory, which the next shift reads in front of its prompt.
+
+**The review guard is an event, not a variable.** `maybeSendReviews` looks for a `role:review` event of the job in the last six days, so a restarted scheduler does not send the same week twice. It only runs inside `maybeSendDigest`, so a shop without `digestAt` sends no review on its own, and `shopfloor role review <job> --notify` is the manual way.
+
 **SQLite is synchronous here.** `node:sqlite` is a blocking API, which is right for this scale and wrong for thousands of jobs. If the shop ever grows that far, the queries are all in one file.
 
 ## Tests
 
-`node --test`, forty nine of them. The schedule and directive tests are pure. The lifecycle, queue and http tests each create a temporary `SHOPFLOOR_HOME`, so they never touch a real shop, and they set the environment variable before the dynamic imports, because `config.mjs` reads it at import time. Nothing needs the network, and nothing calls an agent CLI. A delivery in a test is a shell command that appends to a file in the temporary home, which is the same path a real carrier takes.
+`node --test`, sixty five of them. The schedule and directive tests are pure. The lifecycle, queue and http tests each create a temporary `SHOPFLOOR_HOME`, so they never touch a real shop, and they set the environment variable before the dynamic imports, because `config.mjs` reads it at import time. Nothing needs the network, and nothing calls an agent CLI. A delivery in a test is a shell command that appends to a file in the temporary home, which is the same path a real carrier takes. A role test writes a small `fake-claude` executable that records its arguments and answers in the CLI's JSON shape, and swaps the network for a stub with `setRoleFetch`, so the flags, the briefing and the screening are all checked without a model or Google.
 
 ## Style
 

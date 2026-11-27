@@ -10,6 +10,7 @@ import { buildDigest } from './digest.mjs'
 import { adapterNames } from './adapters/index.mjs'
 import { dispatchOutbox, sendOne, retryOutbox } from './outbox.mjs'
 import { parseSchedule, nextRun } from './schedule.mjs'
+import { buildReview } from './review.mjs'
 
 const UI_DIR = join(dirname(fileURLToPath(import.meta.url)), 'ui')
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json' }
@@ -229,6 +230,17 @@ async function api (req, res, { path, url, config }) {
     if (method === 'POST' && id && action === 'hold') {
       return send(res, 200, db.updateOutboxEntry(db.getOutboxEntry(id).id, { status: 'held', note: body.note || 'held by hand' }))
     }
+  }
+
+  // Roles are read here and changed from the command line, because a job ad
+  // is a file someone writes, not a form.
+  if (section === 'roles' && method === 'GET') {
+    if (!id) return send(res, 200, db.listRoles().map(({ source, ...role }) => role))
+    const job = db.getJob(id)
+    const role = job ? db.getRole(job.id) : null
+    if (!role) return send(res, 404, { error: `no role on ${id}` })
+    if (action === 'review') return send(res, 200, { text: buildReview(job, { days: Number(url.searchParams.get('days') || 7) }) })
+    return send(res, 200, { ...role, job: job.name, enabled: job.enabled })
   }
 
   if (section === 'events' && method === 'GET') return send(res, 200, db.listEvents({ limit: Number(url.searchParams.get('limit') || 100) }))

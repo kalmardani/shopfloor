@@ -12,6 +12,9 @@ import { shopHealth, jobHealth, humanAge } from '../src/health.mjs'
 import { adapterNames, getAdapter } from '../src/adapters/index.mjs'
 import { dispatchOutbox, sendOne, retryOutbox } from '../src/outbox.mjs'
 import { directiveHelp } from '../src/directives.mjs'
+import { buildSpec, hireRole, updateRole, agentSettings, floorRules } from '../src/role.mjs'
+import { buildReview } from '../src/review.mjs'
+import { gatherForRole, renderSnapshot } from '../src/sources/google.mjs'
 
 const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'))
 const argv = process.argv.slice(2)
@@ -59,6 +62,15 @@ const HELP = `shopfloor ${pkg.version} — a shop floor for the agents you alrea
   shopfloor outbox retry <id> | outbox hold <id> [--note ...]
   shopfloor outbox dispatch             one pass of the outgoing queue
 
+  shopfloor role check <file.md>        read a job ad and say what is wrong with it
+  shopfloor role hire <name> --file <file.md>   a worker and a job from a job ad, switched off
+  shopfloor role set <job> --file <file.md>     replace the job ad, the worker follows
+  shopfloor role show <job>             the role as stored, with what the shop floor enforces
+  shopfloor role data <job>             gather the numbers now and show them, without a run
+  shopfloor role review <job> [--days 7] [--notify]   the weekly review
+  shopfloor role connect <job>          sign in to Google once, for read only access
+  shopfloor role list
+
   shopfloor doctor                      what stopped quietly, what is waiting, what it cost
   shopfloor digest [--notify]           the morning text, optionally through notifyCommand
   shopfloor heartbeat <job>             the dead man's switch URL for an outside process
@@ -100,6 +112,7 @@ async function main () {
     case 'inbox': return cmdInbox()
     case 'memory': return cmdMemory()
     case 'outbox': return await cmdOutbox()
+    case 'role': return await cmdRole()
     case 'doctor': return cmdDoctor()
     case 'digest': return cmdDigest()
     case 'heartbeat': case 'hb': return cmdHeartbeat()
@@ -291,6 +304,7 @@ async function cmdDecide (state) {
       return console.log(`${entry.id.slice(0, 8)} stays in the building`)
     }
     const result = await sendOne(entry.id)
+    if (result.ok && result.path) return console.log(`approved, the draft is in ${result.path}`)
     return console.log(result.ok
       ? `${entry.id.slice(0, 8)} went out on ${entry.channel}`
       : `approved, and it waits in the outbox: ${result.reason}`)
@@ -419,6 +433,89 @@ async function cmdOutbox () {
     console.log(`${e.id.slice(0, 8)}  ${(e.job_name || '—').padEnd(20)} ${e.channel.padEnd(10)} ${(e.recipient || '—').padEnd(24)} ${e.status.padEnd(8)} ${(e.subject || String(e.body).split('\n')[0] || '').slice(0, 44)}`)
     if (e.note) console.log(`    ${e.note}`)
   }
+}
+
+async function cmdRole () {
+  const action = positional[1]
+  const readFile = (p) => readFileSync(resolveHome(String(need(p, '--file'))), 'utf8')
+
+  if (action === 'check') {
+    const text = readFile(positional[2] || flags.file)
+    const { spec, errors } = buildSpec(text, { jobName: flags.name ? String(flags.name) : null })
+    if (errors.length) {
+      console.log('The role is not ready:')
+      for (const e of errors) console.log(`  - ${e}`)
+      process.exitCode = 1
+      return
+    }
+    return printRole(spec)
+  }
+  if (action === 'hire') {
+    const name = need(positional[2], 'role name')
+    const { job, worker, spec } = hireRole({ name, text: readFile(flags.file) })
+    printRole(spec)
+    console.log('')
+    console.log(`hired ${job.name}, worker ${worker.name} with a ${spec.budgetUsdDay} USD day cap`)
+    return console.log(`the job is off. shopfloor role data ${job.name} checks the access, shopfloor job on ${job.name} starts it`)
+  }
+  if (action === 'set') {
+    const job = need(db.getJob(positional[2]), `job ${positional[2]}`)
+    const role = updateRole({ job, text: readFile(flags.file) })
+    return console.log(`${job.name} has version ${role.version} of its role`)
+  }
+  if (action === 'show') {
+    const job = need(db.getJob(positional[2]), `job ${positional[2]}`)
+    const role = need(db.getRole(job.id), `a role on ${job.name}`)
+    console.log(`version ${role.version}, changed ${new Date(role.updated_at).toLocaleString()}, job ${job.enabled ? 'on' : 'off'}`)
+    printRole(role.spec)
+    console.log('')
+    console.log(floorRules(role.spec))
+    console.log('')
+    return console.log(role.spec.body)
+  }
+  if (action === 'data') {
+    const job = need(db.getJob(positional[2]), `job ${positional[2]}`)
+    const role = need(db.getRole(job.id), `a role on ${job.name}`)
+    const snapshot = await gatherForRole(role.spec)
+    console.log(renderSnapshot(snapshot))
+    if (snapshot.errors.length) process.exitCode = 1
+    return
+  }
+  if (action === 'review') {
+    const job = need(db.getJob(positional[2]), `job ${positional[2]}`)
+    const text = buildReview(job, { days: Number(flags.days || 7) })
+    console.log(text)
+    if (flags.notify) {
+      const sent = await notify(text)
+      console.log(sent ? '(sent through notifyCommand)' : '(no notifyCommand in the config)')
+    }
+    return
+  }
+  if (action === 'connect') {
+    const job = need(db.getJob(positional[2]), `job ${positional[2]}`)
+    const role = need(db.getRole(job.id), `a role on ${job.name}`)
+    const { connectGoogle } = await import('../src/sources/google-consent.mjs')
+    console.log(await connectGoogle(role.spec))
+    return console.log(`shopfloor role data ${job.name} shows whether the numbers come through`)
+  }
+  const roles = db.listRoles()
+  if (!roles.length) return console.log('no roles yet')
+  for (const role of roles) {
+    console.log(`${role.job_enabled ? ' ' : '·'} ${role.job_name.padEnd(24)} ${role.spec.title.padEnd(28)} ${String(role.spec.budgetUsdDay).padStart(4)} USD/day  ${role.spec.cadence}  review ${role.spec.reviewDay}  v${role.version}`)
+  }
+}
+
+function printRole (spec) {
+  const agent = agentSettings(spec)
+  console.log(`${spec.title}${spec.site ? ', ' + spec.site : ''}`)
+  console.log(`goal        ${spec.goalMetric}${spec.goal ? ', ' + spec.goal : ''}`)
+  console.log(`budget      ${spec.budgetUsdDay} USD a day`)
+  console.log(`cadence     ${spec.cadence}, review on ${spec.reviewDay} with the digest`)
+  for (const tool of spec.tools) console.log(`tool        ${tool.name.padEnd(15)} ${tool.access.padEnd(6)} ${tool.target || ''}`)
+  console.log(`agent tools ${agent.tools.join(', ') || 'none'}, everything else refused`)
+  console.log(`drafts      ${spec.draftsDir}, at most ${spec.maxDraftsPerRun} a shift${spec.styleCheck ? ', through the writing check' : ''}`)
+  if (spec.credentials) console.log(`credentials ${spec.credentials.type}${spec.credentialsFile ? ' from ' + spec.credentialsFile : ''}${spec.credentials.keyFile ? ' ' + spec.credentials.keyFile : ''}, values never shown`)
+  if (spec.never.length) console.log(`never       ${spec.never.join('; ')}`)
 }
 
 function cmdDoctor () {

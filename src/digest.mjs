@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import * as db from './db.mjs'
 import { loadConfig } from './config.mjs'
 import { shopHealth, humanAge, startOfToday } from './health.mjs'
+import { maybeSendReviews } from './review.mjs'
 
 // The one piece of writing the shop floor hands you every morning. It names
 // what stopped quietly, what is waiting for a decision, and what the day cost.
@@ -47,6 +48,16 @@ export function buildDigest ({ hours = 24, at = Date.now() } = {}) {
     lines.push('')
   }
 
+  const roles = db.listRoles()
+  if (roles.length) {
+    lines.push('## Roles')
+    for (const role of roles) {
+      const drafts = health.pendingApprovals.filter((a) => a.job_id === role.job_id && a.kind === 'outbox').length
+      lines.push(`- ${role.job_name}, ${role.spec.title}, ${role.job_enabled ? 'on' : 'off'}, ${drafts} draft(s) waiting, review on ${role.spec.reviewDay}`)
+    }
+    lines.push('')
+  }
+
   lines.push(`## Last ${hours} hours`)
   lines.push(`- ${runs.length} run(s): ${Object.entries(byStatus).map(([k, v]) => `${v} ${k}`).join(', ') || 'none'}`)
   lines.push(`- cost ${cost.toFixed(2)} USD, today ${db.costSince(startOfToday()).toFixed(2)} USD of ${loadConfig().maxUsdPerDay} USD`)
@@ -77,6 +88,13 @@ export async function maybeSendDigest ({ config = loadConfig(), at = Date.now() 
   const text = buildDigest({ at })
   db.addEvent({ level: 'info', kind: 'digest', message: text.split('\n').slice(0, 6).join(' ') })
   await notify(text, config)
+  // A role's weekly review rides along with the digest on its review day, so
+  // it arrives through the same command and at the same hour.
+  try {
+    await maybeSendReviews({ config, at })
+  } catch (err) {
+    db.addEvent({ level: 'error', kind: 'role:review', message: `the weekly review failed: ${err.message}` })
+  }
   return true
 }
 

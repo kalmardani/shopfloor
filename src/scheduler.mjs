@@ -101,7 +101,7 @@ export async function serveScheduler ({ config = loadConfig(), log = console.log
       if (Date.now() - lastPrune > 6 * 3600 * 1000) {
         lastPrune = Date.now()
         const removed = db.pruneRuns(config.keepRunDays)
-        const settled = db.pruneInbox(config.keepRunDays) + db.pruneOutbox(config.keepRunDays)
+        const settled = db.pruneInbox(config.keepRunDays) + db.pruneOutbox(config.keepRunDays) + db.pruneRoleSnapshots(config.keepRunDays)
         if (removed) log(`[${stamp()}] pruned ${removed} old run(s)`)
         if (settled) log(`[${stamp()}] pruned ${settled} settled inbox and outbox row(s)`)
       }

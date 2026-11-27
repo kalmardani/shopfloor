@@ -107,6 +107,21 @@ CREATE TABLE IF NOT EXISTS events (
   run_id TEXT,
   message TEXT
 );
+CREATE TABLE IF NOT EXISTS roles (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  source TEXT NOT NULL,
+  spec TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS role_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  run_id TEXT,
+  at INTEGER NOT NULL,
+  ok INTEGER NOT NULL DEFAULT 0,
+  data TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS heartbeats (
   job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
   last_at INTEGER NOT NULL,
@@ -119,6 +134,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS inbox_dedupe_idx ON inbox(job_id, dedupe_key);
 CREATE INDEX IF NOT EXISTS inbox_status_idx ON inbox(status, created_at);
 CREATE INDEX IF NOT EXISTS outbox_status_idx ON outbox(status, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS outbox_dedupe_idx ON outbox(job_id, dedupe_key);
+CREATE INDEX IF NOT EXISTS role_snapshots_idx ON role_snapshots(job_id, at DESC);
 `
 
 // CREATE TABLE IF NOT EXISTS leaves an older database without the columns that
@@ -635,4 +651,70 @@ export function lastOutboxSentAt () {
 export function pruneOutbox (days) {
   const cutoff = now() - days * 86400 * 1000
   return open().prepare("DELETE FROM outbox WHERE created_at < ? AND status = 'sent'").run(cutoff).changes
+}
+
+
+/* ---------- roles ---------- */
+
+// The job ad is kept as written, next to the spec read from it, so what the
+// agent was told and what the shop floor enforced can always be compared.
+export function setRole ({ jobId, source, spec }) {
+  const d = open()
+  const cur = getRole(jobId)
+  d.prepare(`INSERT INTO roles (job_id, source, spec, version, updated_at) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(job_id) DO UPDATE SET source = excluded.source, spec = excluded.spec,
+               version = excluded.version, updated_at = excluded.updated_at`)
+    .run(jobId, String(source), toJson(spec), cur ? cur.version + 1 : 1, now())
+  return getRole(jobId)
+}
+
+export function getRole (jobId) {
+  const row = open().prepare('SELECT * FROM roles WHERE job_id = ?').get(jobId)
+  return row ? { ...row, spec: parse(row.spec) } : null
+}
+
+export function listRoles () {
+  return open().prepare(`SELECT r.*, j.name AS job_name, j.enabled AS job_enabled FROM roles r
+                         JOIN jobs j ON j.id = r.job_id ORDER BY j.name`).all()
+    .map((row) => ({ ...row, spec: parse(row.spec), job_enabled: !!row.job_enabled }))
+}
+
+export function addRoleSnapshot ({ jobId, runId = null, ok = false, data, at = now() }) {
+  open().prepare('INSERT INTO role_snapshots (job_id, run_id, at, ok, data) VALUES (?, ?, ?, ?, ?)')
+    .run(jobId, runId, at, ok ? 1 : 0, toJson(data))
+}
+
+export function listRoleSnapshots (jobId, { since = 0, until = Number.MAX_SAFE_INTEGER, onlyOk = false } = {}) {
+  return open().prepare(`SELECT * FROM role_snapshots WHERE job_id = ? AND at >= ? AND at <= ? ${onlyOk ? 'AND ok = 1' : ''}
+                         ORDER BY at`).all(jobId, since, until)
+    .map((row) => ({ ...row, ok: !!row.ok, data: parse(row.data) }))
+}
+
+export function pruneRoleSnapshots (days) {
+  const cutoff = now() - days * 86400 * 1000
+  return open().prepare('DELETE FROM role_snapshots WHERE at < ?').run(cutoff).changes
+}
+
+// What one job put in the outbox inside a window, with the decision on each.
+export function outboxWithDecisions (jobId, { since = 0, until = Number.MAX_SAFE_INTEGER } = {}) {
+  return open().prepare(`SELECT o.*, a.state AS decision, a.note AS decision_note, a.decided_at AS decided_at
+                         FROM outbox o LEFT JOIN approvals a ON a.id = o.approval_id
+                         WHERE o.job_id = ? AND o.created_at >= ? AND o.created_at <= ?
+                         ORDER BY o.created_at`).all(jobId, since, until)
+}
+
+// Decisions taken inside a window, on outbox entries of one job, whenever the
+// entry itself was made. A proposal from last week approved on Monday counts.
+export function decisionsFor (jobId, { since = 0, until = Number.MAX_SAFE_INTEGER } = {}) {
+  return open().prepare(`SELECT a.*, o.subject AS subject, o.created_at AS made_at FROM approvals a
+                         LEFT JOIN outbox o ON o.id = a.outbox_id
+                         WHERE a.job_id = ? AND a.kind = 'outbox' AND a.decided_at >= ? AND a.decided_at <= ?
+                         ORDER BY a.decided_at`).all(jobId, since, until)
+}
+
+export function eventsFor (jobId, { kinds = [], since = 0, until = Number.MAX_SAFE_INTEGER } = {}) {
+  const d = open()
+  const filter = kinds.length ? `AND kind IN (${kinds.map(() => '?').join(', ')})` : ''
+  return d.prepare(`SELECT * FROM events WHERE job_id IS ? AND at >= ? AND at <= ? ${filter} ORDER BY at`)
+    .all(jobId, since, until, ...kinds)
 }

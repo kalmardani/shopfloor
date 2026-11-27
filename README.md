@@ -91,6 +91,17 @@ shopfloor approvals                      # one entry, one decision
 shopfloor approve 9f8e7d6c
 ```
 
+A role, a worker hired from a job ad, with its own number to move, its own tools and its own ceiling.
+
+```bash
+shopfloor role check examples/roles/organic-seo.md
+shopfloor role hire seo --file examples/roles/organic-seo.md   # starts switched off
+shopfloor role connect seo                                     # one Google sign in, read only
+shopfloor role data seo                                        # do the numbers come through?
+shopfloor job on seo
+shopfloor role review seo                                      # the week, also sent with the digest
+```
+
 Something that runs outside Shopfloor and should be missed when it dies.
 
 ```bash
@@ -128,6 +139,10 @@ shopfloor doctor
 
 **Approval gates.** A job marked `--approval` creates a run that waits. Approve it from the web interface or the command line and it goes through. Reject it with a note and the reason stays in the log. Mail, posts and deploys belong here.
 
+**Roles.** A role is a job written as a job ad. A block at the top names the number the work is meant to move, the tools with their access level, what the role must never do, a day budget and the cadence, and the prose under it goes to the agent as the description of the job. The block is enforced in code and not only in the prompt. A role reads and proposes, and its only write is a draft that waits at the approval gate. See [Roles](#roles) below.
+
+**A weekly review.** On the review day of each role the morning digest is followed by one more text. It says what the worker did, what it cost against its budget, how its number moved against the week before, and which proposals a person approved, rejected or left waiting. Every figure is counted from the database, none is taken from the agent.
+
 **A morning digest.** One text with what needs attention, what waits for a decision, what ran, what failed and what it cost. `notifyCommand` in the config receives it on standard input, so Telegram, mail, a file or a desktop banner all work without this project growing a dependency.
 
 **A web interface.** Board, approvals, runs with full output, workers, digest. Served from `src/ui`, three files, no build step, local only unless you change the host.
@@ -144,6 +159,53 @@ shopfloor doctor
 Every adapter is handed what the job knows and what woke it up. A prompt adapter puts both in front of the prompt, and `process` passes them as `SHOPFLOOR_MEMORY`, `SHOPFLOOR_EVENT` and `SHOPFLOOR_EVENT_SOURCE`, so a shell script reads them with `$`.
 
 A headless agent run has nobody to click an allow button. Give `claude_local` an `--allow-tools` list, or `--skip-permissions` when you know what that means. The gate that protects you is the approval step in front of the job.
+
+## Roles
+
+Sam Oh of Ahrefs gave each of his agents a whole job and a weekly call, and the first one was a Head of Organic SEO. A role in Shopfloor is that arrangement on a single machine. The job ad lives in a Markdown file, and `shopfloor role hire` turns it into a `claude_local` worker with the day cap of the ad and a job on its cadence, switched off until you say so.
+
+```markdown
+---
+title: Head of Organic SEO
+goal_metric: gsc.clicks
+budget_usd_day: 2
+cadence: 40 6 * * 1,3,5
+review_day: mon
+style_check: node ~/bin/check-writing.mjs
+credentials_file: ~/.config/shopfloor/google.env
+credentials: oauth GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET SEO_REFRESH_TOKEN
+tools:
+  - search_console read sc-domain:example.com
+  - ga4 read 123456789
+  - site read ~/sites/example.com
+  - web read
+  - drafts write
+never:
+  - deploy
+  - send outreach email
+---
+You own the organic traffic of example.com ...
+```
+
+What the block means, and where it is enforced.
+
+| field | what the shop floor does with it |
+| --- | --- |
+| `goal_metric` | the headline of the weekly review. One of `gsc.clicks`, `gsc.impressions`, `gsc.ctr`, `gsc.position`, `ga4.organicSessions`, `ga4.sessions` |
+| `tools` | `name access target`. `search_console` and `ga4` are read by Shopfloor before the run and handed over as a table, so the agent never holds a credential. `site` becomes Read, Grep and Glob on that folder, `web` becomes WebSearch and WebFetch. `drafts write` is the only write a role can have |
+| `budget_usd_day` | the day cap of the worker, and `--max-budget-usd` on each run for what is left of the day |
+| `cadence`, `review_day` | the job schedule, and the weekday the review rides along with the digest |
+| `never` | written into the briefing. The real boundary is below |
+| `style_check` | a command that gets each draft on standard input and exits 0 when it is clean. A draft that fails never reaches a person, and the next shift reads why in its memory |
+| `credentials` | `oauth <client id var> <client secret var> <refresh token var>` from `credentials_file`, or `service_account <key file>`. Names only, never values |
+
+A role run is narrowed on every run, whatever the worker config or the user settings of the machine say. Only the agent tools the role names exist (`--tools`), Bash, Write, Edit and the agent tool are denied outright (`--disallowedTools`, which wins over a bypass mode), no MCP server is loaded (`--strict-mcp-config`), user settings files are ignored (`--restricted`), and anything not allowed is refused without asking (`--permission-mode dontAsk`). What arrives in the inbox reaches the agent as text and cannot change any of this.
+
+What a role run says back is screened before anything is stored. Drafts go to the outbox on the `draft` channel and ask for a decision at once, even when sending is off. Any other outbox channel and any `::reply` is refused and counted in the review. An approved draft is saved as a Markdown file in `drafts_dir`, which the role check keeps outside the site folder, so a deploy of the site cannot publish it. Nothing else happens, the change itself is made by a person.
+
+When a role needs its numbers and none came, the run ends before the agent is called, at no cost, with the reason in the log. An agent without its data is the one that starts inventing it.
+
+Google access is read only, `webmasters.readonly` and `analytics.readonly`. `shopfloor role connect <job>` opens the consent page in your browser, listens on 127.0.0.1 for the answer, and writes the refresh token into the env file under the name the role gives, without printing it. The OAuth client has to be a desktop client with the Search Console API and the Google Analytics Data API switched on in its Google Cloud project. A service account works too, added as a user in Search Console and as a viewer in GA4.
 
 ## What a run can say back
 
@@ -226,7 +288,7 @@ See `examples/shop.json` for the shape.
 node --test
 ```
 
-Forty nine tests over the schedule grammar, the run lifecycle, timeouts, budget ceilings, approval gates, silence detection, heartbeats, the inbox and its dedupe key, memory and its provenance, the outbox with its pacing and its gate, the directive parser, and the http api. No test needs the network, and none calls an agent CLI.
+Sixty five tests over the schedule grammar, the run lifecycle, timeouts, budget ceilings, approval gates, silence detection, heartbeats, the inbox and its dedupe key, memory and its provenance, the outbox with its pacing and its gate, the directive parser, roles with their boundaries, drafts and weekly review, and the http api. No test needs the network, and none calls an agent CLI. A role run in a test talks to a fake `claude` executable and a fake Google.
 
 ## What it is not
 
